@@ -38,7 +38,7 @@
    "name": "Tik Video Toolkit",
    "version_name": "1.0.6",
    "permissions": [ "storage", "downloads", "declarativeNetRequestWithHostAccess", "scripting", "system.display", "alarms", "nativeMessaging" ],
-   "version": "1.0.5",
+   "version": "1.0.6",
    "web_accessible_resources": [ {
       "matches": [ "*://*.tiktok.com/*" ],
       "resources": [ "icons/shop-cart.png", "assets/i18n.js", "assets/tiktok-content.js", "assets/tiktok-hook.js", "icons/icon-32.png" ],
