@@ -1,0 +1,47 @@
+{
+   "action": {
+      "default_icon": {
+         "16": "icons/icon-16.png",
+         "32": "icons/icon-32.png"
+      },
+      "default_popup": "popup.html",
+      "default_title": "Tik Video Toolkit"
+   },
+   "background": {
+      "service_worker": "service-worker-loader.js",
+      "type": "module"
+   },
+   "content_scripts": [ {
+      "js": [ "assets/tiktok-loader.js", "assets/volume-balance-content.js" ],
+      "matches": [ "*://*.tiktok.com/*" ],
+      "run_at": "document_idle"
+   }, {
+      "js": [ "assets/license-gate-main.js", "assets/editor-player-menu.js", "assets/tiktok-hook.js" ],
+      "matches": [ "*://*.tiktok.com/*" ],
+      "run_at": "document_start",
+      "world": "MAIN"
+   },{
+	  "matches": ["*://*.tiktok.com/*"],
+	  "js": ["assets/multi-select.js"],
+	  "run_at": "document_idle",
+	  "world": "ISOLATED"
+	} ],
+   "description": "Download videos, Picture-in-Picture, enhanced video playback, and audio normalization.",
+   "host_permissions": [ "*://*.tiktok.com/*", "https://tikwm.com/*", "https://www.tikwm.com/*", "https://clipmaster.thangpham.io.vn/*" ],
+   "icons": {
+      "128": "icons/icon-128.png",
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
+   },
+   "manifest_version": 3,
+   "name": "Tik Video Toolkit",
+   "version_name": "1.0.5",
+   "permissions": [ "storage", "downloads", "declarativeNetRequestWithHostAccess", "scripting", "system.display", "alarms", "nativeMessaging" ],
+   "version": "1.0.5",
+   "web_accessible_resources": [ {
+      "matches": [ "*://*.tiktok.com/*" ],
+      "resources": [ "icons/shop-cart.png", "assets/i18n.js", "assets/tiktok-content.js", "assets/tiktok-hook.js", "icons/icon-32.png" ],
+      "use_dynamic_url": false
+   } ]
+}

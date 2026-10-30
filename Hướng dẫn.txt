@@ -1,0 +1,54 @@
+HƯỚNG DẪN CÀI "MỞ APP SỬA VIDEO" - TIK VIDEO TOOLKIT
+====================================================
+Chỉ cài 1 lần, mất khoảng 1 phút.
+
+
+TRƯỚC KHI CÀI
+  - Dùng Windows và Google Chrome.
+  - Đã nạp extension Tik Video Toolkit vào Chrome.
+  - Để thư mục native_host ở chỗ cố định, ví dụ D:\TikVideoToolkit\native_host.
+    Đừng để trong Downloads hay Desktop vì lỡ xóa hoặc dời là mất tác dụng.
+
+
+CÀI ĐẶT
+  Bước 1. Mở thư mục native_host.
+
+  Bước 2. Xem trong thư mục có file  tik_native_host.exe  không:
+
+          CÓ     -> bấm đúp  install_native_host_exe.bat
+                    (không cần cài thêm gì)
+
+          KHÔNG  -> cài Python 3 trước (python.org, nhớ tick "Add Python to PATH"),
+                    rồi bấm đúp  install_native_host.bat
+
+  Bước 3. Đợi thấy dòng "Đã cài xong", nhấn phím bất kỳ để đóng cửa sổ.
+
+  Bước 4. Đóng hết Chrome rồi mở lại. Thử bấm nút mở app sửa video.
+
+  Nếu cửa sổ cài hỏi "ID extension": vào chrome://extensions, copy dòng ID của
+  Tik Video Toolkit, dán vào rồi nhấn Enter.
+
+
+LƯU Ý
+  - Nếu app sửa video bạn chọn là file .py thì máy vẫn cần cài Python.
+    Nếu là file .exe thì không cần.
+  - Dời thư mục native_host sang chỗ khác: chạy lại file cài ở Bước 2.
+
+
+GẶP LỖI?
+  Thông báo "Không tìm thấy cầu nối Native Messaging..."
+    -> Chạy lại file cài ở Bước 2. Nếu trong thư mục có file .exe thì chạy
+       install_native_host_exe.bat, dù thông báo có ghi tên file khác.
+
+  Thông báo "Native host has exited"
+    -> Bản Python: máy chưa cài Python.
+       Bản .exe: phần mềm diệt virus đang chặn tik_native_host.exe,
+       hãy cho phép (loại trừ) thư mục native_host.
+
+  Vẫn lỗi: gửi file  %LOCALAPPDATA%\TikVideoToolkit\native_host.log  cho người
+  hỗ trợ (dán đường dẫn này vào thanh địa chỉ của File Explorer để mở).
+
+
+GỠ CÀI ĐẶT
+  Bấm đúp  uninstall_native_host_exe.bat  (bản .exe)
+  hoặc     uninstall_native_host.bat      (bản Python)

@@ -1,0 +1,9 @@
+{
+  "name": "com.tik_video_toolkit.editor_bridge",
+  "description": "Tik Video Toolkit - mở app sửa video với video vừa tải",
+  "path": "tik_native_host.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://deddaocafdbgjnegckikdplhohfcoikm/"
+  ]
+}

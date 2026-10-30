@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cài đặt tải xuống</title>
+<style>
+  :root{
+    --bg:#0f1117;
+    --card:#1a1e2c;
+    --card-hover:#212638;
+    --border:rgba(255,255,255,0.08);
+    --border-strong:rgba(255,255,255,0.18);
+    --text:#f1f5f9;
+    --text-dim:rgba(241,245,249,0.58);
+    --accent:#3b82f6;
+    --accent-2:#8b5cf6;
+    --accent-off:#475569;
+    --ok:#34d399;
+    --warn:#fbbf24;
+  }
+  *{box-sizing:border-box;}
+  html{background:var(--bg); width:680px; min-width:680px;}
+  body{
+    margin:0;
+    width:680px;
+    min-width:680px;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+  }
+
+  /* ---------- Header ---------- */
+  .header{
+    position:relative;
+    display:flex;
+    align-items:stretch;
+    gap:12px;
+    padding:12px 16px;
+    border-bottom:1px solid var(--border);
+    background:
+      radial-gradient(90% 170% at 0% 0%, rgba(59,130,246,.24), transparent 62%),
+      radial-gradient(70% 170% at 100% 0%, rgba(139,92,246,.18), transparent 62%);
+  }
+  .header img{
+    align-self:center;
+    width:34px;
+    height:34px;
+    border-radius:10px;
+    box-shadow:0 4px 14px rgba(59,130,246,.35);
+  }
+  .titles{
+    flex:0 0 auto;
+    min-width:0;
+    display:flex;
+    flex-direction:column;
+    justify-content:space-between;
+  }
+  .header h1{
+    font-size:15px;
+    font-weight:700;
+    margin:0;
+    line-height:1.2;
+    letter-spacing:.2px;
+  }
+  .header p{
+    display:flex;
+    align-items:center;
+    height:34px;
+    font-size:11px;
+    color:var(--text-dim);
+    margin:0;
+  }
+  .saved-toast{
+    position:absolute;
+    left:62px;
+    bottom:17px;
+    z-index:2;
+    pointer-events:none;
+    font-size:11px;
+    font-weight:600;
+    color:var(--ok);
+    background:linear-gradient(rgba(52,211,153,.14),rgba(52,211,153,.14)),var(--bg);
+    border:1px solid rgba(52,211,153,.3);
+    padding:4px 11px;
+    border-radius:999px;
+    opacity:0;
+    transform:translateY(-2px);
+    transition:opacity .2s, transform .2s;
+  }
+  .saved-toast.show{
+    opacity:1;
+    transform:none;
+  }
+  .header:has(.saved-toast.show) .titles p{ visibility:hidden; }
+
+  /* ---------- License / activation (nằm trong header) ---------- */
+  .license-panel{
+    flex:1;
+    min-width:0;
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+  }
+  .license-status{display:flex;flex-wrap:wrap;align-items:center;gap:1px 12px;min-height:16px;}
+  .license-state{display:inline-flex;align-items:center;gap:6px;min-width:0;}
+  .license-state-dot{width:10px;height:10px;border-radius:50%;background:var(--warn);box-shadow:0 0 10px rgba(251,191,36,.5);flex:0 0 auto;}
+  .license-state-dot.active{background:var(--ok);box-shadow:0 0 10px rgba(52,211,153,.55);}
+  .license-state-dot.error{background:#fb7185;box-shadow:0 0 10px rgba(251,113,133,.5);}
+  .license-message{color:var(--text-dim);font-size:11px;line-height:1.4;}
+  .license-meta{font-size:11px;color:#bfdbfe;line-height:1.4;}
+  .license-meta[hidden]{display:none;}
+  .license-form{display:flex;align-items:center;gap:8px;}
+  .license-input{
+    flex:1 1 90px;min-width:90px;height:34px;padding:0 10px;border:1px solid var(--border-strong);border-radius:9px;
+    background:rgba(15,17,23,.74);color:var(--text);font:600 12px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;
+    letter-spacing:.5px;text-transform:uppercase;outline:none;
+  }
+  .license-input:focus{border-color:#60a5fa;box-shadow:0 0 0 2px rgba(59,130,246,.18);}
+  .license-button,.license-link{
+    flex:0 0 auto;white-space:nowrap;
+    border:1px solid transparent;border-radius:9px;font:600 11px/1.2 inherit;cursor:pointer;transition:filter .15s,opacity .15s,background .15s;
+  }
+  .license-button{height:34px;padding:0 13px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;}
+  .license-button:hover{filter:brightness(1.12);}
+  .license-button:disabled,.license-link:disabled{cursor:not-allowed;opacity:.55;}
+  .license-link{padding:3px 0;background:transparent;color:#bfdbfe;text-decoration:underline;text-underline-offset:2px;}
+  .license-busy{font-size:11px;color:var(--text-dim);}
+  .license-busy[hidden]{display:none;}
+  .license-notice{
+    padding:5px 9px;
+    border-radius:8px;
+    font-size:11px;
+    line-height:1.4;
+    color:#a7f3d0;
+    background:rgba(52,211,153,.12);
+    border:1px solid rgba(52,211,153,.3);
+  }
+  .license-notice.error{
+    color:#fda4af;
+    background:rgba(251,113,133,.10);
+    border-color:rgba(251,113,133,.35);
+  }
+  .license-notice[hidden]{display:none;}
+  .license-status:has(.license-busy:not([hidden])) .license-meta{display:none;}
+
+  fieldset.content{border:0;margin:0;min-inline-size:0;}
+  fieldset.content:disabled{opacity:.48;}
+  fieldset.content:disabled .item{cursor:not-allowed;}
+  fieldset.content:disabled .item:hover{background:var(--card);border-color:var(--border);box-shadow:none;}
+  fieldset.content:disabled .switch input,.content:disabled .gear{cursor:not-allowed;}
+
+  /* ---------- Two-column layout ---------- */
+  .content{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:16px;
+    padding:14px 16px 16px;
+    align-items:start;
+  }
+  .group{
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+    min-width:0;
+  }
+  .group-title{
+    font-size:10.5px;
+    font-weight:700;
+    letter-spacing:.9px;
+    text-transform:uppercase;
+    color:var(--text-dim);
+    margin:0 2px 2px;
+  }
+
+  /* ---------- Setting card ---------- */
+  .item{
+    display:grid;
+    grid-template-columns:34px 1fr auto;
+    grid-template-areas:
+      "ico name sw"
+      ".   hint hint";
+    column-gap:11px;
+    row-gap:5px;
+    align-items:center;
+    background:var(--card);
+    border:1px solid var(--border);
+    border-radius:14px;
+    padding:calc(11px - .4mm) 12px calc(12px - .4mm);
+    cursor:pointer;
+    user-select:none;
+    transition:background .15s, border-color .15s, box-shadow .15s;
+  }
+  .item:hover{
+    background:var(--card-hover);
+    border-color:var(--border-strong);
+  }
+  .item:has(input:checked){
+    border-color:rgba(59,130,246,.55);
+    background:
+      linear-gradient(135deg, rgba(59,130,246,.14), rgba(139,92,246,.08)),
+      var(--card);
+    box-shadow:0 0 0 1px rgba(59,130,246,.12), 0 6px 18px rgba(59,130,246,.10);
+  }
+  .ico{
+    grid-area:ico;
+    width:34px;
+    height:34px;
+    border-radius:10px;
+    display:grid;
+    place-items:center;
+  }
+  .ico svg{
+    width:18px;
+    height:18px;
+    fill:none;
+    stroke:currentColor;
+    stroke-width:1.9;
+    stroke-linecap:round;
+    stroke-linejoin:round;
+  }
+  .ico.blue{ background:rgba(59,130,246,.16); color:#60a5fa; }
+  .ico.violet{ background:rgba(139,92,246,.17); color:#a78bfa; }
+  .ico.pink{ background:rgba(236,72,153,.15); color:#f472b6; }
+  .ico.teal{ background:rgba(20,184,166,.15); color:#2dd4bf; }
+  .ico.amber{ background:rgba(245,158,11,.15); color:#fbbf24; }
+  .ico.cyan{ background:rgba(34,211,238,.15); color:#22d3ee; }
+  .name{
+    grid-area:name;
+    font-size:13px;
+    font-weight:600;
+    line-height:1.3;
+  }
+  .hint{
+    grid-area:hint;
+    font-size:11px;
+    line-height:1.45;
+    color:var(--text-dim);
+  }
+  .need{
+    display:inline-block;
+    margin-top:5px;
+    font-size:10px;
+    font-weight:600;
+    color:var(--warn);
+    background:rgba(251,191,36,.10);
+    border:1px solid rgba(251,191,36,.25);
+    padding:1px 7px;
+    border-radius:999px;
+  }
+
+  /* ---------- Chia đoạn: card with a gear that opens the inline settings ---------- */
+  .item.has-gear{
+    grid-template-columns:34px 1fr auto auto;
+    grid-template-areas:
+      "ico name gear sw"
+      ".   hint hint hint";
+  }
+  .gear{
+    grid-area:gear;
+    width:28px;
+    height:28px;
+    padding:0;
+    border:1px solid var(--border);
+    border-radius:8px;
+    background:rgba(255,255,255,.05);
+    color:var(--text-dim);
+    display:grid;
+    place-items:center;
+    cursor:pointer;
+    transition:background .15s, color .15s, border-color .15s;
+  }
+  .gear:hover{
+    background:rgba(255,255,255,.1);
+    color:var(--text);
+    border-color:var(--border-strong);
+  }
+  .gear[aria-expanded="true"]{
+    background:rgba(34,211,238,.14);
+    border-color:rgba(34,211,238,.5);
+    color:#22d3ee;
+  }
+  .gear svg{
+    width:16px;
+    height:16px;
+    fill:none;
+    stroke:currentColor;
+    stroke-width:1.9;
+    stroke-linecap:round;
+    stroke-linejoin:round;
+  }
+  .gear:focus-visible{
+    outline:2px solid var(--accent);
+    outline-offset:2px;
+  }
+  .sum{
+    display:inline-block;
+    margin-top:5px;
+    font-size:10px;
+    font-weight:600;
+    color:#22d3ee;
+    background:rgba(34,211,238,.10);
+    border:1px solid rgba(34,211,238,.28);
+    padding:1px 7px;
+    border-radius:999px;
+  }
+  /* The settings replace the hint text inside the card (same grid cell). */
+  .hint[hidden]{ display:none; }
+  .seg-config{
+    grid-area:hint;
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+    margin-top:2px;
+    cursor:default;
+  }
+  .seg-config[hidden]{ display:none; }
+  .seg-row{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    font-size:12px;
+  }
+  .seg-row em{
+    font-style:normal;
+    font-size:10.5px;
+    color:var(--text-dim);
+  }
+  .seg-row input{
+    width:64px;
+    height:28px;
+    box-sizing:border-box;
+    border-radius:8px;
+    border:1px solid var(--border-strong);
+    background:rgba(255,255,255,.06);
+    color:var(--text);
+    font:inherit;
+    font-size:13px;
+    text-align:center;
+    outline:none;
+    cursor:text;
+    user-select:text;
+    -webkit-user-select:text;
+  }
+  .seg-row input:focus{ border-color:var(--accent); }
+  .seg-row input.bad{ border-color:#fb7185; }
+  .seg-err{
+    font-size:11px;
+    color:#fb7185;
+  }
+  .seg-err[hidden]{ display:none; }
+
+  /* ---------- Cân bằng âm lượng ---------- */
+  .item.has-volume{
+    grid-template-areas:
+      "ico name sw"
+      ".   hint hint"
+      ".   volume volume";
+  }
+  .volume-controls{
+    grid-area:volume;
+    display:grid;
+    grid-template-columns:1fr 70px;
+    align-items:center;
+    gap:10px;
+    margin-top:3px;
+    cursor:default;
+  }
+  .volume-controls[aria-disabled="true"]{
+    opacity:.45;
+  }
+  .volume-range{
+    width:100%;
+    accent-color:#22d3ee;
+    cursor:pointer;
+  }
+  .volume-range:disabled{ cursor:not-allowed; }
+  .volume-number{
+    display:flex;
+    align-items:center;
+    height:30px;
+    padding:0 8px;
+    border:1px solid var(--border-strong);
+    border-radius:8px;
+    background:rgba(255,255,255,.06);
+  }
+  .volume-number:focus-within{ border-color:var(--accent); }
+  .volume-number input{
+    width:100%;
+    min-width:0;
+    padding:0;
+    border:0;
+    outline:0;
+    background:transparent;
+    color:var(--text);
+    font:inherit;
+    font-size:13px;
+    text-align:right;
+    cursor:text;
+  }
+  .volume-number input:disabled{ cursor:not-allowed; }
+  .volume-number span{
+    margin-left:3px;
+    font-size:12px;
+    color:var(--text-dim);
+  }
+
+  /* ---------- Toggle switch ---------- */
+  .switch{
+    grid-area:sw;
+    position:relative;
+    display:inline-block;
+    width:40px;
+    height:22px;
+    flex-shrink:0;
+  }
+  .switch input{
+    position:absolute;
+    inset:0;
+    width:100%;
+    height:100%;
+    margin:0;
+    opacity:0;
+    cursor:pointer;
+  }
+  .slider{
+    position:absolute;
+    inset:0;
+    background-color:var(--accent-off);
+    transition:background .18s, box-shadow .18s;
+    border-radius:999px;
+    pointer-events:none;
+  }
+  .slider::before{
+    position:absolute;
+    content:"";
+    height:16px;
+    width:16px;
+    left:3px;
+    top:3px;
+    background-color:#fff;
+    box-shadow:0 1px 3px rgba(0,0,0,.35);
+    transition:transform .18s;
+    border-radius:50%;
+  }
+  .switch input:checked + .slider{
+    background:linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow:0 0 10px rgba(59,130,246,.45);
+  }
+  .switch input:checked + .slider::before{
+    transform:translateX(18px);
+  }
+  .switch input:focus-visible + .slider{
+    outline:2px solid var(--accent);
+    outline-offset:2px;
+  }
+
+  /* ---------- Mở app sửa video ---------- */
+  .item.has-editor{
+    grid-template-areas:
+      "ico    name   sw"
+      ".      hint   hint"
+      "editor editor editor";
+  }
+  .item.has-editor .need{ margin-top:0; }
+  .editor-config{
+    grid-area:editor;
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+    margin-top:3px;
+    cursor:default;
+  }
+  .editor-pick{
+    display:flex;
+    gap:7px;
+  }
+  .editor-btn{
+    display:block;
+    flex:1 1 auto;
+    min-width:0;
+    height:30px;
+    padding:0 8px;
+    border:1px solid var(--border-strong);
+    border-radius:8px;
+    background:rgba(255,255,255,.07);
+    color:var(--text);
+    font-family:inherit;
+    font-size:11px;
+    font-weight:600;
+    line-height:1.2;
+    text-align:center;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    cursor:pointer;
+    transition:background .15s, border-color .15s, color .15s;
+  }
+  .editor-btn:hover{ background:rgba(255,255,255,.13); }
+  .editor-btn:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .editor-btn:disabled{ opacity:.5; cursor:not-allowed; }
+  .editor-btn.is-ok{
+    background:rgba(52,211,153,.14);
+    border-color:rgba(52,211,153,.55);
+    color:#a7f3d0;
+  }
+  .editor-btn.is-ok:hover{ background:rgba(52,211,153,.24); }
+  .editor-btn.is-error{
+    background:rgba(251,113,133,.10);
+    border-color:rgba(251,113,133,.55);
+    color:#fda4af;
+  }
+  .editor-btn.is-error:hover{ background:rgba(251,113,133,.20); }
+  .editor-note{
+    font-size:10.5px;
+    line-height:1.4;
+    color:#fb7185;
+    word-break:break-word;
+  }
+  fieldset.content:disabled .editor-btn{ cursor:not-allowed; }
+  .editor-rootchip{
+    flex:0 1 auto;
+    max-width:50%;
+    min-width:0;
+    height:30px;
+    padding:0 9px;
+    display:block;
+    border:1px dashed var(--border-strong);
+    border-radius:8px;
+    color:var(--text-dim);
+    font-size:11px;
+    font-weight:600;
+    line-height:28px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    cursor:default;
+  }
+  .editor-rootchip.is-ok{
+    border-color:rgba(52,211,153,.55);
+    color:#a7f3d0;
+  }
+
+  /* ---------- Footer tip ---------- */
+  .tip{
+    display:flex;
+    align-items:center;
+    gap:9px;
+    padding:10px 12px;
+    border:1px dashed var(--border-strong);
+    border-radius:14px;
+    font-size:11px;
+    line-height:1.4;
+    color:var(--text-dim);
+  }
+  .tip svg{
+    flex:0 0 16px;
+    width:16px;
+    height:16px;
+    fill:none;
+    stroke:currentColor;
+    stroke-width:1.9;
+    stroke-linecap:round;
+    stroke-linejoin:round;
+    color:var(--accent);
+  }
+
+  /* ---------- Kéo-thả sắp xếp lại các ô ---------- */
+  .content > .group{ min-height:64px; }
+  .item.is-dragging{
+    position:fixed;
+    z-index:1000;
+    margin:0;
+    border-color:rgba(96,165,250,.75);
+    box-shadow:0 16px 36px rgba(0,0,0,.55), 0 0 0 1px rgba(96,165,250,.45);
+  }
+  .card-slot{
+    flex:0 0 auto;
+    border:1.5px dashed rgba(96,165,250,.55);
+    border-radius:14px;
+    background:rgba(59,130,246,.07);
+  }
+  body.is-reordering,
+  body.is-reordering *{
+    cursor:grabbing !important;
+    user-select:none !important;
+    -webkit-user-select:none !important;
+  }
+  body.is-reordering .item{ pointer-events:none; }
+
+  @media (prefers-reduced-motion:reduce){
+    *{ transition:none !important; }
+  }
+</style>
+</head>
+<body>
+  <div class="header">
+    <img src="icons/icon-32.png" alt="" />
+    <div class="titles">
+      <h1>Tik Video Toolkit</h1>
+      <p>Kích hoạt và cài đặt</p>
+    </div>
+    <section class="license-panel" aria-live="polite" aria-label="Bản quyền">
+      <div class="license-status">
+        <span class="license-state">
+          <span class="license-state-dot" id="licenseStateDot" aria-hidden="true"></span>
+          <span class="license-message" id="licenseMessage">Đang kiểm tra bản quyền…</span>
+        </span>
+        <span class="license-meta" id="licenseMeta" hidden></span>
+        <span class="license-busy" id="licenseBusy" hidden>Đang kết nối máy chủ…</span>
+      </div>
+      <div class="license-form">
+        <input class="license-input" id="licenseKey" type="text" autocomplete="off" spellcheck="false" maxlength="64" placeholder="Nhập key bản quyền" aria-label="Key bản quyền" />
+        <button class="license-button" id="licenseActivate" type="button">Kích hoạt</button>
+        <button class="license-link" id="licenseCheck" type="button">Kiểm tra lại</button>
+      </div>
+      <div class="license-notice" id="licenseNotice" role="status" hidden></div>
+    </section>
+    <span class="saved-toast" id="savedToast">✓ Đã lưu</span>
+  </div>
+
+  <fieldset class="content" id="settingsArea" disabled aria-label="Cài đặt tính năng">
+    <!-- Cột trái: trình phát & tiện ích -->
+    <section class="group">
+
+
+      <div class="item has-editor" id="editorBridgeCard">
+        <span class="ico teal">
+          <svg viewBox="0 0 24 24"><rect x="3" y="5" width="13" height="14" rx="2"/><path d="m16 10 5-3v10l-5-3z"/><path d="M7 9h5M7 13h3"/></svg>
+        </span>
+        <span class="name">Mở app sửa video</span>
+        <span class="switch">
+          <input type="checkbox" id="editorBridgeEnabled" aria-describedby="editorBridgeHint" />
+          <span class="slider"></span>
+        </span>
+        <span class="hint" id="editorBridgeHint"><span class="need">Cần: Chọn thư mục nâng cao + Native Host</span></span>
+        <div class="editor-config" id="editorBridgeConfig">
+          <div class="editor-pick">
+            <button class="editor-btn" id="editorAppBtn" type="button">Chọn file app</button>
+            <div class="editor-rootchip" id="editorRootLine">Thư mục gốc: chưa có</div>
+          </div>
+          <div class="editor-note" id="editorNote" role="alert" hidden></div>
+          <!-- Các control gốc vẫn do popup.js điều khiển; editor-bridge-ui.js chỉ đọc/click chúng. -->
+          <div id="editorEngine" hidden>
+            <input id="editorAppPath" type="text" tabindex="-1" autocomplete="off" />
+            <button id="editorBrowseApp" type="button" tabindex="-1">Chọn file app…</button>
+            <button id="editorCheckApp" type="button" tabindex="-1">Kiểm tra app</button>
+            <div class="editor-root" id="editorRootText">Chưa xác định thư mục gốc cho app sửa video.</div>
+            <div class="editor-status" id="editorBridgeStatus"></div>
+          </div>
+        </div>
+      </div>
+
+      <label class="item">
+        <span class="ico teal">
+          <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><rect x="12" y="11" width="7" height="5" rx="1"/></svg>
+        </span>
+        <span class="name">Luôn hiển thị trên cùng</span>
+        <span class="switch">
+          <input type="checkbox" id="playerAlwaysOnTop" />
+          <span class="slider"></span>
+        </span>
+        <span class="hint">Mở video luôn nằm trên mọi cửa sổ.</span>
+      </label>
+
+      <label class="item">
+        <span class="ico blue">
+          <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+        </span>
+        <span class="name">Preview khi rê chuột vào video</span>
+        <span class="switch">
+          <input type="checkbox" id="hoverPreview" />
+          <span class="slider"></span>
+        </span>
+        
+      </label>
+
+      <div class="item has-volume" id="volumeBalanceCard">
+        <span class="ico cyan">
+          <svg viewBox="0 0 24 24"><path d="M4 10v4h4l5 4V6l-5 4H4z"/><path d="M16 9a4 4 0 0 1 0 6"/><path d="M18.5 6.5a7.5 7.5 0 0 1 0 11"/></svg>
+        </span>
+        <span class="name">Tự động cân bằng âm lượng</span>
+        <span class="switch">
+          <input type="checkbox" id="volumeBalanceEnabled" aria-label="Tự động cân bằng âm lượng" aria-describedby="volumeBalanceHint" />
+          <span class="slider"></span>
+        </span>
+
+        <div class="volume-controls" id="volumeBalanceControls" aria-disabled="true">
+          <input class="volume-range" type="range" id="volumeBalanceRange" min="0" max="200" step="1" value="100" aria-label="Mức âm lượng" />
+          <label class="volume-number" for="volumeBalanceValue" title="Nhập mức âm lượng từ 0 đến 200 phần trăm">
+            <input type="number" id="volumeBalanceValue" min="0" max="200" step="1" inputmode="numeric" aria-label="Mức âm lượng phần trăm" />
+            <span>%</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="item has-gear" id="segmentCard">
+        <span class="ico cyan">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        </span>
+        <span class="name">Chia đoạn video</span>
+        <button type="button" class="gear" id="segmentGear" title="Cấu hình số đoạn và số cột" aria-label="Cấu hình Chia đoạn" aria-expanded="false" aria-controls="segmentConfig">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+        <span class="switch">
+          <input type="checkbox" id="segmentEnabled" aria-label="Chia đoạn video" />
+          <span class="slider"></span>
+        </span>
+        <span class="hint" id="segmentHint">
+          Hiện cửa sổ chia video thành nhiều đoạn.
+          <br /><span class="sum" id="segmentSummary"></span>
+        </span>
+        <div class="seg-config" id="segmentConfig" hidden>
+          <label class="seg-row" for="segmentCount">
+            <span>Số đoạn <em>(2 – 20)</em></span>
+            <input type="number" id="segmentCount" min="2" max="20" step="1" inputmode="numeric" />
+          </label>
+          <label class="seg-row" for="segmentCols">
+            <span>Số cột hiển thị <em>(1 – 4)</em></span>
+            <input type="number" id="segmentCols" min="1" max="4" step="1" inputmode="numeric" />
+          </label>
+          <div class="seg-err" id="segmentError" role="alert" hidden></div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- Cột phải: tải xuống -->
+    <section class="group">
+
+
+      <label class="item">
+        <span class="ico blue">
+          <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0-4-4m4 4 4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        </span>
+        <span class="name">Hỏi nơi lưu mỗi lần tải xuống</span>
+        <span class="switch">
+          <input type="checkbox" id="askWhereToSave" />
+          <span class="slider"></span>
+        </span>
+      </label>
+
+      <label class="item">
+        <span class="ico violet">
+          <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+        </span>
+        <span class="name">Chọn thư mục nâng cao</span>
+        <span class="switch">
+          <input type="checkbox" id="advancedFolderMode" />
+          <span class="slider"></span>
+        </span>
+        <span class="hint">Chọn một thư mục gốc, rồi liên kết từng video với một thư mục con khi tải.</span>
+      </label>
+
+      <label class="item">
+        <span class="ico pink">
+          <svg viewBox="0 0 24 24"><path d="M5 3l14 7-6 2-2 6L5 3z"/></svg>
+        </span>
+        <span class="name">Menu chuột phải thư mục con</span>
+        <span class="switch">
+          <input type="checkbox" id="subfolderContextMenu" />
+          <span class="slider"></span>
+        </span>
+        <span class="hint">
+          Chuột phải vào video để gán vào thư mục con.
+          <br /><span class="need">Cần: Chọn thư mục nâng cao + thư mục gốc</span>
+        </span>
+      </label>
+
+      <label class="item">
+        <span class="ico amber">
+          <svg viewBox="0 0 24 24"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>
+        </span>
+        <span class="name">Tự động dán dữ liệu clipboard</span>
+        <span class="switch">
+          <input type="checkbox" id="autoPasteClipboard" />
+          <span class="slider"></span>
+        </span>
+        <span class="hint">Tự động dán clipboard “Đặt tên khi tải” hoặc ô tìm kiếm TikTok (khi ô trống).</span>
+      </label>
+    </section>
+  </fieldset>
+
+  <script src="editor-bridge-ui.js"></script>
+  <script src="popup.js"></script>
+  <script src="card-reorder.js"></script>
+</body>
+</html>
