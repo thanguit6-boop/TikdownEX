@@ -1,6 +1,9 @@
 // ===== [Download] License module import =====
 import { getDownloadResolverProof, licenseCheckIfStale } from './license.js';
 // ===== [/Download] License module import =====
+// ===== [Auto-reload] Tự tải lại extension sau khi hub ghi đè file =====
+import './auto-reload.js';
+// ===== [/Auto-reload] =====
 
 // These are the privileged operations behind preview, player and download.
 // The UI flag is only a display hint; each protected call verifies the signed
