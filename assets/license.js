@@ -212,13 +212,13 @@ async function licenseBuildRequest(licenseKey, machineId, mode) {
 }
 
 // Returns {raw} (parsed JSON) or {error: 'network_error' | 'bad_response'}.
-async function licensePost(req, timeoutMs) {
+async function licensePost(req, timeoutMs, url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     let resp;
     try {
-      resp = await fetch(LICENSE_ENDPOINT, {
+      resp = await fetch(url || LICENSE_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams(req).toString(),
@@ -578,6 +578,359 @@ async function getDownloadResolverProof() {
   };
 }
 
+// ----- Free trial request (the "Thử miễn phí" button, same flow as Multi Phone Manager) -----
+// eligibility -> send_code (a 6-digit code is mailed to the address) -> request -> the admin approves on the server
+// -> status hands over the license key -> the key is activated through licenseActivate() above, like a typed key.
+// The trial answers are plain JSON and grant nothing by themselves: the key they deliver is still checked by the
+// RSA-signed answer of kiemtra_key_v2.php when it is activated, so a forged trial answer can never unlock a license.
+// Only fields of the expected type are passed on to the popup (trialClean), and the popup shows them as text only.
+//
+// Storage keys (chrome.storage.local):
+//  - tik_trial_request  {request_id, poll_token, email, created_at, received, key, days}  request sent from this install
+//  - tik_trial_done     {machine_id, received_at}  this install already received a trial key (the server stays the real gate)
+//  - tik_trial_reset_seen {token}  the admin's last "Reset Dùng thử" (token of action eligibility) this install already applied
+
+const TRIAL_ENDPOINT = 'https://clipmaster.thangpham.io.vn/api/trial_api.php';
+// Must match trial_api.php: the app_name and the HMAC secret registered there for this extension
+// (the same dedicated token the license server already uses for tik_extension).
+const TRIAL_APP_NAME = LICENSE_APP_NAME;
+const TRIAL_TIMEOUT_MS = 10000;
+const TRIAL_K_REQUEST = 'tik_trial_request';
+const TRIAL_K_DONE = 'tik_trial_done';
+const TRIAL_K_RESET_SEEN = 'tik_trial_reset_seen';
+const TRIAL_EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const TRIAL_MSG_EMAIL = 'Email không hợp lệ. Vui lòng kiểm tra lại.';
+const TRIAL_MSG_PHONE = 'Số điện thoại không đúng định dạng Việt Nam (VD: 0912345678 hoặc +84912345678).';
+const TRIAL_MSG_NO_MID = 'Không đọc được mã máy (Machine ID lỗi hoặc rỗng).';
+const TRIAL_MSG_NET = 'Không kiểm tra được lúc này. Vui lòng thử lại sau.';
+const TRIAL_MSG_GOT_KEY = 'Đã nhận key dùng thử. Bấm để tự động kích hoạt.';
+const TRIAL_MSG_SENT = 'Yêu cầu dùng thử đã gửi. Bấm để kiểm tra máy chủ đã cấp key chưa.';
+const TRIAL_MSG_REJECTED = 'Không nhận được key dùng thử. Vui lòng liên hệ hỗ trợ.';
+
+function trialValidEmail(email) {
+  return typeof email === 'string' && email.length > 0 && email.length <= 190 && TRIAL_EMAIL_RE.test(email);
+}
+
+function trialError(code, message) {
+  return { status: 'error', code: code, message: message };
+}
+
+// Keep only the fields the popup needs, each with the expected type (never pass the raw server object around).
+function trialClean(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const k of ['status', 'code', 'reason', 'state']) {
+    if (typeof raw[k] === 'string') out[k] = raw[k].slice(0, 64);
+  }
+  if (typeof raw.message === 'string') out.message = raw.message.trim().slice(0, 300);
+  if (typeof raw.duration_text === 'string') out.duration_text = raw.duration_text.trim().slice(0, 64);
+  for (const k of ['license_key', 'request_id', 'poll_token', 'reset_token']) {
+    if (typeof raw[k] === 'string' || typeof raw[k] === 'number') out[k] = String(raw[k]).slice(0, 128);
+  }
+  for (const k of ['days', 'attempts_left_today', 'expires_in', 'resend_after', 'retry_after']) {
+    if (raw[k] === undefined || raw[k] === null || raw[k] === '') continue;
+    const n = Number(raw[k]);
+    if (Number.isFinite(n)) out[k] = n;
+  }
+  return out;
+}
+
+async function trialMachineId() {
+  try { return await licenseGetMachineId(true); } catch (e) { return ''; }
+}
+
+// POST to trial_api.php. Always resolves to an object (network problem -> status 'error', code 'network_error').
+async function trialApiCall(action, machineId, extra, fields) {
+  const t = String(licenseNowSec());
+  let signature;
+  try {
+    // Must match trial_api.php: app_name|action|machine_id|t|extra
+    signature = await licenseHmacHex([TRIAL_APP_NAME, action, machineId, t, extra || ''].join('|'));
+  } catch (e) {
+    return trialError('internal_error', LICENSE_MESSAGES.internal_error);
+  }
+  // No hw_id: a browser extension cannot read the Windows MachineGuid, so the server falls back to machine id + IP.
+  const data = Object.assign({}, fields || {}, { app_name: TRIAL_APP_NAME, action: action, machine_id: machineId, t: t, signature: signature });
+  const sent = await licensePost(data, TRIAL_TIMEOUT_MS, TRIAL_ENDPOINT);
+  if (sent.error === 'network_error') return trialError('network_error', LICENSE_MESSAGES.network_error);
+  const res = sent.error ? {} : trialClean(sent.raw);
+  if (!res.status) return trialError('invalid_response', 'Phản hồi không hợp lệ từ máy chủ.');
+  return res;
+}
+
+async function trialStateLoad() {
+  try {
+    const s = (await chrome.storage.local.get(TRIAL_K_REQUEST))[TRIAL_K_REQUEST];
+    if (s && typeof s === 'object' && !Array.isArray(s) && s.request_id && s.poll_token) return s;
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+async function trialStateSave(st) {
+  try { await chrome.storage.local.set({ [TRIAL_K_REQUEST]: st }); return true; } catch (e) { return false; }
+}
+
+async function trialStateClear() {
+  try { await chrome.storage.local.remove(TRIAL_K_REQUEST); } catch (e) { /* ignore */ }
+}
+
+async function trialDoneCheck(machineId) {
+  try {
+    const d = (await chrome.storage.local.get(TRIAL_K_DONE))[TRIAL_K_DONE];
+    return !!d && typeof d === 'object' && !!machineId && d.machine_id === machineId;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function trialDoneMark(machineId) {
+  try {
+    await chrome.storage.local.set({ [TRIAL_K_DONE]: { machine_id: machineId, received_at: licenseNowSec() } });
+  } catch (e) { /* the server is the real gate */ }
+}
+
+// The admin pressed "Reset Dùng thử" for this machine (key page -> Sửa): forget the local "already got a trial key" mark
+// and the old request, so the machine can ask again like a new one. Each reset (each token) is handled only once.
+// Returns true when the local marks were just removed.
+async function trialApplyServerReset(rawToken) {
+  const token = String(rawToken == null ? '' : rawToken).trim();
+  if (!token) return false;
+  try {
+    const seen = (await chrome.storage.local.get(TRIAL_K_RESET_SEEN))[TRIAL_K_RESET_SEEN];
+    if (seen && typeof seen === 'object' && String(seen.token || '') === token) return false;
+    await chrome.storage.local.remove([TRIAL_K_DONE, TRIAL_K_REQUEST]);
+    await chrome.storage.local.set({ [TRIAL_K_RESET_SEEN]: { token: token } });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Purchased key: the admin granted a key to this machine in advance (key page -> Sửa -> Machine ID + "Số ngày kích hoạt").
+// The key stays "unused" on the server until it is activated. -> {ok, grant}: ok = the server answered,
+// grant = {key, days, duration_text} when a key is waiting, else null. Nothing is stored locally: the server is the source.
+async function trialClaim(machineId) {
+  const res = await trialApiCall('claim', machineId, '', null);
+  if (res.status !== 'ok') return { ok: false, grant: null };
+  const key = res.state === 'ready' ? licenseNormalizeKey(res.license_key) : '';
+  if (!key) return { ok: true, grant: null };
+  return {
+    ok: true,
+    grant: { key: key, days: res.days === undefined ? null : res.days, duration_text: res.duration_text || '' },
+  };
+}
+
+// What the popup draws. stage: eligible | sent | received | rejected | error | hidden
+// The popup shows the button only while enabled is true (eligible / sent / received); any other view is hidden
+// there and its message goes to the popup console.
+function trialView(stage, message, extra) {
+  return Object.assign({
+    ok: true,
+    stage: stage,
+    message: message || '',
+    enabled: stage === 'eligible' || stage === 'sent' || stage === 'received',
+  }, extra || {});
+}
+
+function trialStoredView(st) {
+  return st && st.received && st.key ? trialView('received', TRIAL_MSG_GOT_KEY) : trialView('sent', TRIAL_MSG_SENT);
+}
+
+// Button for a purchased key the admin granted: [Nhận được key N ngày, nhấn để kích hoạt] (popup shows view.label).
+function trialGrantView(grant) {
+  let text = String(grant.duration_text || '').trim();
+  if (!text && Number.isFinite(grant.days) && grant.days > 0) text = grant.days + ' ngày';
+  return trialView(
+    'received',
+    'Quản trị viên đã cấp key' + (text ? ' ' + text : '') + ' cho máy này. Bấm để tự động kích hoạt (thời hạn tính từ lúc kích hoạt).',
+    { grant: true, label: text ? 'Nhận được key ' + text + ', nhấn để kích hoạt' : '' }
+  );
+}
+
+// Does this machine get a trial? (a request already sent from this install is followed up with trialCheckStatus)
+async function trialRefresh() {
+  if ((await licenseEvaluate()).licensed === true) return trialView('hidden', '');
+  if (await trialStateLoad()) {
+    // A purchased key the admin granted to this machine comes before a pending trial request (same as Multi Phone Manager).
+    const mine = await trialMachineId();
+    const claimed = mine ? await trialClaim(mine) : { grant: null };
+    return claimed.grant ? trialGrantView(claimed.grant) : trialCheckStatus();
+  }
+
+  const mid = await trialMachineId();
+  if (!mid) return trialView('error', TRIAL_MSG_NO_MID);
+  const res = await trialApiCall('eligibility', mid, '', null);
+  if (res.status !== 'ok') {
+    // The popup hides the button for this view and logs the message (with the error code) to its console.
+    return trialView('error', (res.message || TRIAL_MSG_NET) + (res.code ? '\n(Mã lỗi: ' + res.code + ')' : ''));
+  }
+  switch (res.reason) {
+    case 'key_ready': {
+      // The admin already granted a key to this machine (purchased): fetch it, the button offers to activate it.
+      const claimed = await trialClaim(mid);
+      return claimed.grant ? trialGrantView(claimed.grant) : trialView('error', TRIAL_MSG_NET);
+    }
+    case 'eligible':
+      // "Reset Dùng thử" by the admin: drop the local "already got a trial key" mark before looking at it.
+      await trialApplyServerReset(res.reset_token);
+      if (await trialDoneCheck(mid)) return trialView('hidden', 'Máy này đã nhận key dùng thử rồi nên không thể yêu cầu thêm.');
+      return trialView('eligible', 'Dùng thử miễn phí: gửi email để được duyệt.');
+    case 'trial_pending':
+    case 'trial_approved':
+      return trialView('sent', 'Máy này đã gửi yêu cầu dùng thử. Vui lòng chờ quản trị viên liên hệ qua email.', { enabled: false });
+    case 'has_license':
+      await trialStateClear();
+      return trialView('hidden', 'Máy chủ ghi nhận máy này đang có bản quyền nên không thể dùng thử. Hãy nhập key vào ô bên cạnh.');
+    case 'had_license':
+      return trialView('hidden', 'Máy này đã từng sử dụng bản quyền nên không thể yêu cầu dùng thử.');
+    case 'trial_rejected':
+      await trialStateClear();
+      return trialView('rejected', TRIAL_MSG_REJECTED);
+    default:
+      return trialView('hidden', res.message || 'Không thể yêu cầu dùng thử trên máy này.');
+  }
+}
+
+// Ask for the result of the request sent from this install; when the server grants a key, keep it.
+// notice = a sentence for the popup to show after a click (not after the silent background check).
+async function trialCheckStatus() {
+  const st = await trialStateLoad();
+  if (!st) return trialRefresh();
+  const mid = await trialMachineId();
+  if (!mid) return Object.assign(trialStoredView(st), { error: true, notice: TRIAL_MSG_NO_MID });
+
+  const res = await trialApiCall('status', mid, String(st.request_id), { request_id: st.request_id, poll_token: st.poll_token });
+  if (res.status !== 'ok') {
+    if (res.code === 'not_found') {
+      await trialStateClear();   // the request is gone from the server: check again from the start
+      return trialRefresh();
+    }
+    return Object.assign(trialStoredView(st), { error: true, notice: res.message || TRIAL_MSG_NET });
+  }
+
+  const key = licenseNormalizeKey(res.license_key);
+  if (res.state === 'approved' && key) {
+    await trialStateSave(Object.assign({}, st, { received: true, key: key, days: res.days === undefined ? null : res.days }));
+    await trialDoneMark(mid);
+    return trialView('received', TRIAL_MSG_GOT_KEY);
+  }
+  if (res.state === 'activated') {
+    await trialStateClear();
+    return trialView('hidden', '', { activated: true });
+  }
+  if (res.state === 'rejected') {
+    await trialStateClear();
+    return trialView('rejected', TRIAL_MSG_REJECTED, { error: true, notice: 'Không nhận được key dùng thử.' });
+  }
+  const waiting = !res.state || res.state === 'pending' || res.state === 'approved';
+  return Object.assign(trialStoredView(st), {
+    notice: waiting ? 'Đang đợi Máy chủ cấp key.' : 'Không rõ trạng thái yêu cầu. Vui lòng thử lại sau.',
+  });
+}
+
+// "Đã nhận key, nhấn để kích hoạt": activate the key the server granted, exactly like a key typed in the popup.
+async function trialActivate() {
+  const st = await trialStateLoad();
+  // A purchased key granted by the admin wins over a received trial key (same as Multi Phone Manager); with no grant
+  // (or no answer from the server) the stored trial key is used.
+  const mid = await trialMachineId();
+  const claimed = mid ? await trialClaim(mid) : { grant: null };
+  const grant = claimed.grant;
+  const key = grant ? grant.key : (st && st.key ? licenseNormalizeKey(st.key) : '');
+  if (!key) return { ok: false, verdict: 'no_key', message: 'Không tìm thấy key dùng thử trên máy này.' };
+  const result = await licenseActivate(key);
+  if (result && result.ok) {
+    await trialStateClear();
+    const days = !grant && st && st.days !== undefined ? st.days : null;
+    return Object.assign({}, result, { granted: !!grant, trial_days: days });
+  }
+  return result;   // the key stays stored (or granted on the server), so the button can be pressed again
+}
+
+// Silent check while the popup stays open and the machine has no license: is a granted key waiting for this machine?
+// -> the button view when one is waiting; otherwise {ok:true}, plus revoked:true when the server answered "no key".
+async function trialGrantPoll() {
+  if ((await licenseEvaluate()).licensed === true) return { ok: true };
+  const mid = await trialMachineId();
+  if (!mid) return { ok: true };
+  const claimed = await trialClaim(mid);
+  if (claimed.grant) return trialGrantView(claimed.grant);
+  return { ok: true, revoked: claimed.ok };
+}
+
+// Step 1: mail a 6-digit confirmation code to the address.
+async function trialSendCode(rawEmail) {
+  const email = String(rawEmail == null ? '' : rawEmail).trim();
+  if (!trialValidEmail(email)) return trialError('invalid_email', TRIAL_MSG_EMAIL);
+  const mid = await trialMachineId();
+  if (!mid) return trialError('no_machine_id', TRIAL_MSG_NO_MID);
+  return trialApiCall('send_code', mid, email, { email: email });
+}
+
+// Vietnamese mobile number: 10 digits starting with 03 / 05 / 07 / 08 / 09, also written +84 or 84 followed by the 9 digits
+// after the leading 0. Spaces . - ( ) between digits are ignored. Returns the number as 0xxxxxxxxx, '' when empty (the phone is
+// optional) or null when it is not a Vietnamese mobile number. popup.js has the same rule for the dialog.
+function trialNormalizePhoneVN(raw) {
+  const compact = String(raw == null ? '' : raw).replace(/[\s.\-()]/g, '');
+  if (!compact) return '';
+  const m = /^(?:\+84|84|0)([35789]\d{8})$/.exec(compact);
+  return m ? '0' + m[1] : null;
+}
+
+// Step 2: send the request with the code; on success remember request_id + poll_token for the status checks.
+async function trialRequest(rawEmail, rawPhone, rawCode) {
+  const email = String(rawEmail == null ? '' : rawEmail).trim();
+  const phone = trialNormalizePhoneVN(rawPhone);
+  const code = String(rawCode == null ? '' : rawCode).replace(/\D/g, '');
+  if (!trialValidEmail(email)) return trialError('invalid_email', TRIAL_MSG_EMAIL);
+  if (code.length !== 6) return trialError('code_required', 'Vui lòng nhập mã xác nhận gồm 6 chữ số.');
+  if (phone === null) return trialError('invalid_phone', TRIAL_MSG_PHONE);
+  const mid = await trialMachineId();
+  if (!mid) return trialError('no_machine_id', TRIAL_MSG_NO_MID);
+  if (await trialDoneCheck(mid)) {
+    return trialError('trial_done', 'Máy này đã nhận key dùng thử rồi.\nMỗi máy chỉ được dùng thử 1 lần duy nhất.');
+  }
+
+  // The code is not part of the signature (same as the desktop app).
+  const res = await trialApiCall('request', mid, email + '|' + phone, { email: email, phone: phone, code: code });
+  if (res.status !== 'ok') return res;
+  if (!res.request_id || !res.poll_token) return trialError('invalid_response', 'Không gửi được yêu cầu. Vui lòng thử lại.');
+  const saved = await trialStateSave({ request_id: res.request_id, poll_token: res.poll_token, email: email, created_at: licenseNowSec() });
+  if (!saved) return trialError('storage_error', LICENSE_MESSAGES.storage_error);
+  return { status: 'ok', saved: true };   // poll_token stays inside the service worker
+}
+
+function trialOnMessage(msg, sender, sendResponse) {
+  if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string' || msg.type.indexOf('TRIAL_') !== 0) return false;
+  // The trial flow belongs to the popup only: this extension's own pages, never a content script.
+  if (!sender || sender.id !== chrome.runtime.id || !licenseIsExtensionPage(sender)) return false;
+  let job;
+  switch (msg.type) {
+    case 'TRIAL_REFRESH':
+      job = trialRefresh();
+      break;
+    case 'TRIAL_STATUS':
+      job = trialCheckStatus();
+      break;
+    case 'TRIAL_SEND_CODE':
+      job = trialSendCode(msg.email);
+      break;
+    case 'TRIAL_REQUEST':
+      job = trialRequest(msg.email, msg.phone, msg.code);
+      break;
+    case 'TRIAL_ACTIVATE':
+      job = trialActivate();
+      break;
+    case 'TRIAL_CLAIM':
+      job = trialGrantPoll();
+      break;
+    default:
+      return false;
+  }
+  job.then(sendResponse, () => sendResponse({ ok: false, status: 'error', code: 'internal_error', message: LICENSE_MESSAGES.internal_error }));
+  return true;
+}
+
 // ----- wiring (all listeners are registered synchronously at load, as MV3 requires) -----
 function licenseIsExtensionPage(sender) {
   return !!sender && typeof sender.url === 'string' && sender.url.indexOf(chrome.runtime.getURL('')) === 0;
@@ -630,6 +983,7 @@ function licenseEnsureAlarm() {
 }
 
 chrome.runtime.onMessage.addListener(licenseOnMessage);
+chrome.runtime.onMessage.addListener(trialOnMessage);
 chrome.runtime.onStartup.addListener(() => {
   licenseEnsureAlarm();
   licenseScheduledCheck().catch(() => {});

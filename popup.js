@@ -78,6 +78,10 @@
     }
     currentKeyHint = (status && status.key_hint) || '';
     if (licenseActivate) licenseActivate.textContent = active ? 'Dùng key mới' : 'Kích hoạt';
+    if (trialLicensed !== active) {
+      trialLicensed = active;
+      trialRefreshUi();
+    }
   }
 
   function setLicenseBusy(busy) {
@@ -145,6 +149,452 @@
     const result = await sendLicenseMessage('LICENSE_CHECK');
     setLicenseBusy(false);
     paintLicenseStatus(result.status || null, result.ok ? '' : (result.message || 'Không thể kiểm tra key.'));
+  });
+
+  // ===== [Dùng thử] Nút "Thử miễn phí" (cùng luồng với Multi Phone Manager) =====
+  // Máy chưa có bản quyền: [Thử miễn phí] -> gửi email (xác nhận bằng mã 6 số) -> [Đã gửi]
+  // -> quản trị viên duyệt -> [Đã nhận key, nhấn để kích hoạt] -> tự kích hoạt.
+  // Mọi lời gọi máy chủ nằm ở service worker (assets/license.js, các message TRIAL_*); popup chỉ hiển thị.
+  const trialRow = document.getElementById('trialRow');
+  const trialButton = document.getElementById('trialButton');
+  const trialDialog = document.getElementById('trialDialog');
+  const trialEmail = document.getElementById('trialEmail');
+  const trialSendCodeButton = document.getElementById('trialSendCode');
+  const trialCode = document.getElementById('trialCode');
+  const trialPasteButton = document.getElementById('trialPaste');
+  const trialPhone = document.getElementById('trialPhone');
+  const trialDialogMessage = document.getElementById('trialDialogMessage');
+  const trialCancelButton = document.getElementById('trialCancel');
+  const trialSubmitButton = document.getElementById('trialSubmit');
+  // Popup của Chrome tự đóng ngay khi người dùng bấm sang tab khác (không có cách nào giữ nó mở), nên hộp thoại gửi yêu cầu
+  // được mở trong KHUNG BÊN (side panel): nó nằm cạnh trang, chuyển sang tab hộp thư chép mã vẫn còn nguyên. Trang này tự chạy
+  // ở chế độ khung bên khi mở bằng popup.html?panel=trial (chỉ còn hộp thoại, xem CSS html.trial-panel trong popup.html).
+  const TRIAL_PANEL_PATH = 'popup.html?panel=trial';
+  const IS_TRIAL_PANEL = new URLSearchParams(location.search).get('panel') === 'trial';
+  if (IS_TRIAL_PANEL) document.documentElement.classList.add('trial-panel');
+  const TRIAL_POLL_INTERVAL_MS = 30000;   // đang ở [Đã gửi]: popup còn mở thì cứ chừng này tự hỏi máy chủ (âm thầm)
+  const TRIAL_GRANT_POLL_INTERVAL_MS = 60000;   // chưa có bản quyền: popup còn mở thì cứ chừng này hỏi xem admin đã cấp sẵn key (khách mua) chưa
+  const TRIAL_DRAFT_KEY = 'tik_trial_draft';
+  const TRIAL_BUTTON_TEXT = {
+    eligible: 'Thử miễn phí',
+    error: 'Thử miễn phí',
+    sent: 'Đã gửi',
+    received: 'Đã nhận key, nhấn để kích hoạt',
+    rejected: 'Không nhận được key dùng thử',
+  };
+  let trialLicensed = null;   // trạng thái bản quyền ở lần vẽ gần nhất: chỉ hỏi lại máy chủ khi nó đổi
+  let trialView = { stage: 'hidden' };
+  let trialBusy = false;
+  let trialSeq = 0;
+  let trialPollTimer = null;
+  const trialDialogState = { emailSent: '', expiresAt: 0, left: 0, timer: null };
+
+  function trialValidEmail(email) {
+    return email.length > 0 && email.length <= 190 && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
+  }
+
+  function stopTrialPoll() {
+    if (trialPollTimer) {
+      clearInterval(trialPollTimer);
+      trialPollTimer = null;
+    }
+  }
+
+  function paintTrial(view) {
+    trialView = view && typeof view === 'object' && view.stage
+      ? view
+      : { stage: 'error', enabled: false, message: (view && view.message) || 'Không kiểm tra được lúc này. Vui lòng thử lại sau.' };
+    stopTrialPoll();
+    const stage = trialView.stage;
+    const text = trialView.label || TRIAL_BUTTON_TEXT[stage];   // label: nút [Nhận được key N ngày...] của key admin cấp sẵn
+    // Chỉ hiện nút khi bấm được (Thử miễn phí / Đã gửi để kiểm tra / Nhận key để kích hoạt). Máy đang có bản quyền,
+    // đã dùng thử, không đủ điều kiện, bị từ chối hoặc không kiểm tra được thì ẩn hẳn, không để nút mờ (lý do ghi ở console popup).
+    const show = !settingsUnlocked && text !== undefined && trialView.enabled === true;
+    if (!show && !settingsUnlocked && stage !== 'hidden' && trialView.message) console.info('[trial]', stage + ':', trialView.message);
+    if (trialRow) trialRow.hidden = !show;
+    if (!show || !trialButton) return;
+    const enabled = trialView.enabled === true;
+    trialButton.textContent = text;
+    trialButton.title = trialView.message || '';
+    trialButton.disabled = trialBusy || !enabled;
+    trialButton.classList.toggle('on', enabled);
+    if (stage === 'sent' && enabled) {
+      trialPollTimer = setInterval(() => { trialCheckStatus(true); }, TRIAL_POLL_INTERVAL_MS);
+    }
+  }
+
+  // Hỏi máy chủ máy này có được dùng thử không (hoặc yêu cầu đã gửi đang ở bước nào).
+  async function trialRefreshUi() {
+    const seq = ++trialSeq;
+    paintTrial({ stage: 'hidden' });
+    if (settingsUnlocked) return;
+    const view = await sendLicenseMessage('TRIAL_REFRESH');
+    if (seq !== trialSeq) return;
+    paintTrial(view);
+    if (trialView.stage === 'eligible') resumeTrialDraft();
+    else if (IS_TRIAL_PANEL && !settingsUnlocked) closeTrialPanel();   // đã có bản quyền / đã gửi yêu cầu...: khung bên hết việc
+  }
+
+  async function trialCheckStatus(auto) {
+    if (trialBusy) return;
+    trialBusy = true;
+    if (!auto && trialButton) {
+      trialButton.disabled = true;
+      trialButton.title = 'Đang kiểm tra kết quả...';
+    }
+    const view = await sendLicenseMessage('TRIAL_STATUS');
+    trialBusy = false;
+    paintTrial(view);
+    if (view && view.activated) refreshLicenseStatus();
+    if (!auto && view && view.notice) showLicenseNotice(view.notice, view.error ? 'error' : '');
+  }
+
+  async function trialActivateReceived() {
+    if (trialBusy) return;
+    trialBusy = true;
+    if (trialButton) {
+      trialButton.disabled = true;
+      trialButton.title = 'Đang kích hoạt key dùng thử...';
+    }
+    setLicenseBusy(true);
+    const result = await sendLicenseMessage('TRIAL_ACTIVATE');
+    setLicenseBusy(false);
+    trialBusy = false;
+    paintLicenseStatus(result.status || null, result.ok ? '' : (result.message || 'Không thể kích hoạt key.'));
+    if (result.ok) {
+      showSavedToast();
+      let text = result.granted ? 'Đã kích hoạt key thành công!' : 'Đã kích hoạt key dùng thử thành công!';
+      const expiry = formatExpiry(result.status);
+      const days = Number(result.trial_days);
+      if (expiry) text += ' ' + expiry + '.';
+      else if (Number.isFinite(days) && days > 0) text += ' Thời gian dùng thử: ' + days + ' ngày (tính từ lúc kích hoạt).';
+      showLicenseNotice(text);
+    } else {
+      showLicenseNotice(result.message || 'Kích hoạt thất bại.', 'error');
+    }
+    paintTrial(trialView);   // còn key trên máy -> vẫn cho bấm kích hoạt lại; đã kích hoạt xong -> paintLicenseStatus đã ẩn nút
+  }
+
+  // Key MUA do admin cấp sẵn cho máy này (trang quản lý key -> Sửa -> Machine ID + Số ngày kích hoạt):
+  // máy chủ có key chờ -> nút tự đổi thành [Nhận được key N ngày, nhấn để kích hoạt]; key bị thu hồi -> về trạng thái bình thường.
+  async function trialGrantPoll() {
+    if (settingsUnlocked || trialBusy) return;
+    const seq = trialSeq;
+    const view = await sendLicenseMessage('TRIAL_CLAIM');
+    if (settingsUnlocked || trialBusy || seq !== trialSeq) return;
+    if (view && view.stage) {
+      if (!trialView.grant) paintTrial(view);
+    } else if (view && view.revoked && trialView.grant) {
+      trialRefreshUi();
+    }
+  }
+  setInterval(trialGrantPoll, TRIAL_GRANT_POLL_INTERVAL_MS);
+
+  // Mở hộp thoại trong khung bên. false = không mở được (Chrome cũ chưa có side panel, bị chặn...) -> dùng hộp thoại ngay trong popup như cũ.
+  async function openTrialPanel() {
+    if (IS_TRIAL_PANEL || !chrome.sidePanel || typeof chrome.sidePanel.open !== 'function') return false;
+    try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const windowId = tabs && tabs[0] ? tabs[0].windowId : undefined;
+      if (windowId === undefined) return false;
+      await chrome.sidePanel.setOptions({ path: TRIAL_PANEL_PATH, enabled: true });
+      await chrome.sidePanel.open({ windowId });
+      window.close();   // khung bên ở lại, popup thì đóng
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Đóng khung bên (khi đã gửi xong / bấm Hủy / không còn việc gì để làm). Tắt hẳn để mục này không nằm lại trong danh sách khung bên của Chrome.
+  async function closeTrialPanel() {
+    if (!IS_TRIAL_PANEL || !chrome.sidePanel) return;
+    try {
+      if (typeof chrome.sidePanel.close === 'function') {
+        const win = await chrome.windows.getCurrent();
+        await chrome.sidePanel.close({ windowId: win.id });
+      }
+    } catch { /* tắt bằng setOptions bên dưới */ }
+    try { await chrome.sidePanel.setOptions({ enabled: false }); } catch { /* ignore */ }
+  }
+
+  trialButton?.addEventListener('click', async () => {
+    if (trialView.stage === 'eligible') {
+      if (!(await openTrialPanel())) openTrialDialog(null);
+    } else if (trialView.stage === 'sent') trialCheckStatus(false);
+    else if (trialView.stage === 'received') trialActivateReceived();
+  });
+
+  // ----- Hộp thoại gửi yêu cầu (email + mã 6 số + SĐT) -----
+  function setTrialDialogMessage(text, ok) {
+    if (!trialDialogMessage) return;
+    trialDialogMessage.textContent = text || '';
+    trialDialogMessage.className = 'trial-message' + (ok ? ' ok' : '');
+  }
+
+  function stopTrialCooldown() {
+    if (trialDialogState.timer) {
+      clearTimeout(trialDialogState.timer);
+      trialDialogState.timer = null;
+    }
+  }
+
+  function tickTrialCooldown() {
+    trialDialogState.timer = null;
+    if (trialDialogState.left > 0) {
+      trialSendCodeButton.textContent = 'Gửi lại (' + trialDialogState.left + 's)';
+      trialSendCodeButton.disabled = true;
+      trialDialogState.left -= 1;
+      trialDialogState.timer = setTimeout(tickTrialCooldown, 1000);
+    } else {
+      trialSendCodeButton.textContent = trialDialogState.emailSent ? 'Gửi lại mã' : 'Gửi mã';
+      trialSendCodeButton.disabled = false;
+    }
+  }
+
+  function startTrialCooldown(seconds) {
+    stopTrialCooldown();
+    const n = Number(seconds);
+    trialDialogState.left = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 60;
+    tickTrialCooldown();
+  }
+
+  // Popup của Chrome tự đóng khi người dùng bấm ra ngoài (vd. sang hộp thư để chép mã) nên bản nháp được lưu lại:
+  // mở lại popup trong lúc mã còn hiệu lực là hộp thoại tự mở sẵn, chỉ việc dán mã.
+  function saveTrialDraft() {
+    try {
+      chrome.storage.local.set({
+        [TRIAL_DRAFT_KEY]: {
+          email: trialEmail.value.trim(),
+          phone: trialPhone.value.trim(),
+          email_sent: trialDialogState.emailSent,
+          expires_at: trialDialogState.expiresAt,
+        },
+      });
+    } catch { /* bản nháp chỉ là tiện ích */ }
+  }
+
+  function clearTrialDraft() {
+    try { chrome.storage.local.remove(TRIAL_DRAFT_KEY); } catch { /* ignore */ }
+  }
+
+  function resumeTrialDraft() {
+    try {
+      chrome.storage.local.get(TRIAL_DRAFT_KEY, (result) => {
+        void chrome.runtime.lastError;
+        const draft = result && result[TRIAL_DRAFT_KEY];
+        const resumable = !!draft && typeof draft === 'object' && !!draft.email_sent && Number(draft.expires_at) > Date.now();
+        if (settingsUnlocked || trialView.stage !== 'eligible' || !trialDialog || !trialDialog.hidden) return;
+        if (resumable) openTrialDialog(draft);
+        else if (IS_TRIAL_PANEL) openTrialDialog(null);   // khung bên chỉ để nhập: luôn mở sẵn hộp thoại
+      });
+    } catch { /* ignore */ }
+  }
+
+  function openTrialDialog(draft) {
+    if (!trialDialog) return;
+    stopTrialCooldown();
+    const restored = !!(draft && draft.email_sent && Number(draft.expires_at) > Date.now());
+    trialDialogState.emailSent = restored ? String(draft.email_sent) : '';
+    trialDialogState.expiresAt = restored ? Number(draft.expires_at) : 0;
+    trialEmail.value = restored ? String(draft.email || draft.email_sent) : '';
+    trialPhone.value = restored ? trialCleanPhoneInput(draft.phone) : '';
+    trialCode.value = '';
+    trialCode.disabled = !restored;
+    trialPasteButton.disabled = !restored;
+    trialSubmitButton.disabled = !restored;
+    trialSendCodeButton.disabled = false;
+    trialSendCodeButton.textContent = restored ? 'Gửi lại mã' : 'Gửi mã';
+    setTrialDialogMessage(
+      restored ? 'Đã gửi mã tới ' + trialDialogState.emailSent + '. Nhập mã 6 số trong email rồi bấm "Gửi yêu cầu".' : '',
+      restored
+    );
+    trialDialog.hidden = false;
+    (restored ? trialCode : trialEmail).focus();
+  }
+
+  function closeTrialDialog(discardDraft) {
+    stopTrialCooldown();
+    if (trialDialog) trialDialog.hidden = true;
+    if (discardDraft) clearTrialDraft();
+    closeTrialPanel();   // chỉ có tác dụng khi đang ở khung bên
+  }
+
+  async function sendTrialCode() {
+    const email = trialEmail.value.trim();
+    if (!trialValidEmail(email)) {
+      setTrialDialogMessage('Email không hợp lệ. Vui lòng kiểm tra lại.');
+      return;
+    }
+    setTrialDialogMessage('Đang gửi mã...', true);
+    trialSendCodeButton.disabled = true;
+    const res = await sendLicenseMessage('TRIAL_SEND_CODE', { email });
+    if (res.status === 'ok') {
+      trialDialogState.emailSent = email;
+      const expiresIn = Number(res.expires_in);
+      const ttl = Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 600;
+      trialDialogState.expiresAt = Date.now() + ttl * 1000;
+      trialCode.disabled = false;
+      trialPasteButton.disabled = false;
+      trialSubmitButton.disabled = false;
+      trialCode.focus();
+      const leftToday = res.attempts_left_today;
+      const extra = leftToday !== undefined && leftToday !== null ? ' (hôm nay còn ' + leftToday + ' lượt)' : '';
+      setTrialDialogMessage(
+        'Đã gửi mã tới ' + email + '. Mã có hiệu lực ' + Math.floor(ttl / 60) + ' phút.' +
+        ' Thư có thể mất 1-2 phút và có thể nằm trong mục Thư rác (Spam).' + extra,
+        true
+      );
+      saveTrialDraft();
+      startTrialCooldown(res.resend_after !== undefined ? res.resend_after : 60);
+      return;
+    }
+    setTrialDialogMessage(res.message || 'Không gửi được mã. Vui lòng thử lại.');
+    if (res.code === 'code_cooldown') {
+      startTrialCooldown(res.retry_after !== undefined ? res.retry_after : 60);
+    } else {
+      trialSendCodeButton.disabled = false;
+    }
+    if (res.code === 'not_eligible') trialRefreshUi();   // hết lượt / trạng thái máy đổi -> cập nhật lại nút
+  }
+
+  function pickTrialCode(text) {
+    const source = String(text || '');
+    const found = source.match(/(?<!\d)(\d{6})(?!\d)/) || source.replace(/\s/g, '').match(/^\D*(\d{6})\D*$/);
+    return found ? found[1] : '';
+  }
+
+  async function pasteTrialCode() {
+    let clip = '';
+    try {
+      clip = await navigator.clipboard.readText();
+    } catch {
+      clip = '';
+    }
+    const code = pickTrialCode(clip);
+    if (code) {
+      trialCode.value = code;
+      setTrialDialogMessage('Đã dán mã. Bấm "Gửi yêu cầu" để hoàn tất.', true);
+      return;
+    }
+    setTrialDialogMessage(
+      clip
+        ? 'Clipboard chưa có mã 6 số. Hãy sao chép mã trong email trước (nhấp đúp vào dãy số rồi Ctrl+C).'
+        : 'Không đọc được clipboard. Hãy bấm vào ô mã rồi nhấn Ctrl+V.'
+    );
+    trialCode.focus();
+  }
+
+  // Ô số điện thoại chỉ nhận số điện thoại di động Việt Nam: 0xxxxxxxxx (03/05/07/08/09) hoặc +84xxxxxxxxx / 84xxxxxxxxx.
+  // Gõ hoặc dán gì cũng tự bỏ ký tự lạ (chữ, khoảng trắng, dấu chấm, gạch...) và cắt theo độ dài tối đa.
+  // Cùng quy tắc với trialNormalizePhoneVN trong assets/license.js.
+  function trialCleanPhoneInput(value) {
+    const raw = String(value == null ? '' : value).trim();
+    const plus = raw.startsWith('+');
+    const digits = raw.replace(/\D/g, '');
+    const max = plus || digits.startsWith('84') ? 11 : 10;
+    return (plus ? '+' : '') + digits.slice(0, max);
+  }
+
+  // -> số dạng 0xxxxxxxxx, '' khi để trống (không bắt buộc), null khi không phải số di động Việt Nam.
+  function trialNormalizePhoneVN(value) {
+    const compact = String(value == null ? '' : value).replace(/[\s.\-()]/g, '');
+    if (!compact) return '';
+    const m = /^(?:\+84|84|0)([35789]\d{8})$/.exec(compact);
+    return m ? '0' + m[1] : null;
+  }
+
+  async function submitTrialRequest() {
+    const email = trialEmail.value.trim();
+    const phone = trialNormalizePhoneVN(trialPhone.value);
+    const code = trialCode.value.replace(/\D/g, '');
+    if (!trialValidEmail(email)) {
+      setTrialDialogMessage('Email không hợp lệ. Vui lòng kiểm tra lại.');
+      return;
+    }
+    if (!trialDialogState.emailSent) {
+      setTrialDialogMessage('Vui lòng bấm "Gửi mã" để nhận mã xác nhận qua email trước.');
+      return;
+    }
+    if (email.toLowerCase() !== trialDialogState.emailSent.toLowerCase()) {
+      setTrialDialogMessage('Email đã thay đổi so với email nhận mã. Vui lòng bấm "Gửi lại mã".');
+      return;
+    }
+    if (code.length !== 6) {
+      setTrialDialogMessage('Vui lòng nhập mã xác nhận gồm 6 chữ số.');
+      return;
+    }
+    if (phone === null) {
+      setTrialDialogMessage('Số điện thoại không đúng định dạng Việt Nam (VD: 0912345678 hoặc +84912345678).');
+      trialPhone.focus();
+      return;
+    }
+    trialPhone.value = phone;   // hiện lại dạng chuẩn 0xxxxxxxxx đúng như sẽ gửi đi
+    setTrialDialogMessage('');
+    trialSubmitButton.disabled = true;
+    const res = await sendLicenseMessage('TRIAL_REQUEST', { email, phone, code });
+    trialSubmitButton.disabled = false;
+    if (res.status === 'ok' && res.saved) {
+      closeTrialDialog(true);
+      paintTrial({ stage: 'sent', enabled: true, message: 'Yêu cầu dùng thử đã gửi. Bấm để kiểm tra máy chủ đã cấp key chưa.' });
+      showLicenseNotice('Đã gửi yêu cầu dùng thử. Khi quản trị viên duyệt, bấm nút "Đã gửi" để nhận key.');
+      return;
+    }
+    setTrialDialogMessage(res.message || 'Không gửi được yêu cầu. Vui lòng thử lại.');
+    if (['code_expired', 'code_locked', 'code_used', 'code_required', 'code_email_mismatch'].includes(res.code)) {
+      trialDialogState.emailSent = '';   // buộc xin mã mới
+      trialDialogState.expiresAt = 0;
+      trialCode.value = '';
+      trialPasteButton.disabled = true;
+      trialSubmitButton.disabled = true;
+      clearTrialDraft();
+    }
+    if (res.code === 'not_eligible') {
+      closeTrialDialog(true);
+      trialRefreshUi();   // trạng thái máy đã đổi -> cập nhật lại nút
+    }
+  }
+
+  trialSendCodeButton?.addEventListener('click', sendTrialCode);
+  trialPasteButton?.addEventListener('click', pasteTrialCode);
+  trialSubmitButton?.addEventListener('click', submitTrialRequest);
+  trialCancelButton?.addEventListener('click', () => closeTrialDialog(true));
+  trialEmail?.addEventListener('input', saveTrialDraft);
+  trialPhone?.addEventListener('input', () => {
+    const cleaned = trialCleanPhoneInput(trialPhone.value);
+    if (cleaned !== trialPhone.value) trialPhone.value = cleaned;
+    saveTrialDraft();
+  });
+  trialEmail?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      if (!trialSendCodeButton.disabled) sendTrialCode();
+    }
+  });
+  trialPhone?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      if (!trialSubmitButton.disabled) submitTrialRequest();
+    }
+  });
+  trialCode?.addEventListener('input', () => {
+    trialCode.value = trialCode.value.replace(/\D/g, '').slice(0, 6);
+  });
+  trialCode?.addEventListener('paste', (event) => {
+    const code = pickTrialCode(event.clipboardData && event.clipboardData.getData('text'));
+    if (code) {
+      event.preventDefault();
+      trialCode.value = code;
+    }
+  });
+  trialCode?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      if (!trialSubmitButton.disabled) submitTrialRequest();
+    }
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && trialDialog && !trialDialog.hidden) closeTrialDialog(true);
   });
 
   refreshLicenseStatus();
