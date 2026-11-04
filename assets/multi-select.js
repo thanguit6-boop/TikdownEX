@@ -4288,6 +4288,80 @@
     // whichever mode the user last chose (FAB click or the panel's ×), no
     // matter what else they do on the page.
 
+    /* ---------------- TikTok search keyword -> rename box ("Đặt tên khi tải") ----------------
+     * While the "Tự động dán dữ liệu clipboard" option is ON, the rename box follows the keyword of the search
+     * TikTok is showing: each time that keyword CHANGES (typed + Enter, pasted, a suggestion or a history entry
+     * clicked, back / forward), the rename box gets the new keyword. The click-to-paste above only mirrors the
+     * clipboard text, so a keyword typed by hand used to reach the rename box never (only the first, pasted one).
+     *  - source: the q= parameter of the /search URL (TikTok changes it with history.pushState, no page load),
+     *    i.e. the keyword the shown results really belong to - not whatever is half typed in the input box;
+     *  - only a CHANGE counts: the same keyword again, a reload, or leaving /search and coming back never
+     *    overwrites a name the user edited by hand in the meantime; a changed keyword always does;
+     *  - the keyword last put into the box is kept in chrome.storage.local, so a search that reloads the page
+     *    (instead of a pushState) is still seen as a change; with nothing stored yet (first run) the current
+     *    keyword is only remembered and nothing is overwritten;
+     *  - an empty keyword is ignored; the text is flattened to one line and capped like the click-to-paste.
+     */
+    const SEARCH_KEYWORD_STORE_KEY = NS + "rename_search_keyword";
+    const SEARCH_KEYWORD_POLL_MS = 500;
+    let searchKeywordSynced = "";
+    let searchKeywordLoaded = false;
+
+    // Keyword of the search page being shown ("" when this is not a /search page or it has no q=).
+    function currentSearchKeyword() {
+        try {
+            if (!/^\/search(?:\/|$)/.test(location.pathname)) return "";
+            return String(new URL(location.href).searchParams.get("q") || "")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, RENAME_PASTE_MAX_LENGTH);
+        } catch {
+            return "";
+        }
+    }
+
+    function syncRenameWithSearchKeyword() {
+        if (!searchKeywordLoaded || !selectionRestored || !autoPasteClipboard) return;
+        const keyword = currentSearchKeyword();
+        if (!keyword || keyword === searchKeywordSynced) return;
+        searchKeywordSynced = keyword;
+        try {
+            chrome.storage.local.set({ [SEARCH_KEYWORD_STORE_KEY]: keyword });
+        } catch {}
+        // The box only exists once the list was opened; until then renameDraft is what it is built from.
+        const input = document.getElementById(PANEL_RENAME_INPUT_ID);
+        if (input) input.value = keyword;
+        renameAutoPasted = keyword;
+        renameDraft = keyword;
+        persistRename();
+    }
+
+    function initSearchKeywordSync() {
+        try {
+            chrome.storage.local.get(SEARCH_KEYWORD_STORE_KEY, (res) => {
+                if (chrome.runtime.lastError) return;
+                const stored = res && typeof res[SEARCH_KEYWORD_STORE_KEY] === "string" ? res[SEARCH_KEYWORD_STORE_KEY] : "";
+                searchKeywordSynced = stored;
+                if (!stored) {
+                    searchKeywordSynced = currentSearchKeyword();
+                    if (searchKeywordSynced) {
+                        try {
+                            chrome.storage.local.set({ [SEARCH_KEYWORD_STORE_KEY]: searchKeywordSynced });
+                        } catch {}
+                    }
+                }
+                searchKeywordLoaded = true;
+            });
+        } catch {}
+        setInterval(syncRenameWithSearchKeyword, SEARCH_KEYWORD_POLL_MS);
+        window.addEventListener("popstate", syncRenameWithSearchKeyword);
+        try {
+            if (window.navigation && typeof window.navigation.addEventListener === "function") {
+                window.navigation.addEventListener("currententrychange", syncRenameWithSearchKeyword);
+            }
+        } catch {}
+    }
+
     /* ---------------- init ---------------- */
 
     loadPanelExpandedMode();
@@ -4301,6 +4375,7 @@
     window.addEventListener("pointerdown", onSearchPointerPress, true);
     window.addEventListener("click", onSearchBoxClick, true);
     window.addEventListener("focusin", onSearchBoxFocusIn, true);
+    initSearchKeywordSync();
     loadRootDirHandle();
     syncCheckboxVisibility();
     scanAll();
