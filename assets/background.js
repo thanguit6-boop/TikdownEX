@@ -81,7 +81,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // The resulting media stream still goes directly from the upstream CDN to the
 // browser; this shared host never proxies video bytes.
 const __downloadResolverEndpoint = 'https://clipmaster.thangpham.io.vn/resolve_download_v1.php';
-const __resolverInflight = new Map();
 
 function __resolverError(code) {
   const error = new Error(code || 'resolver_unavailable');
@@ -97,6 +96,9 @@ function __resolverMessage(code) {
     license_not_active: 'Key không còn hiệu lực hoặc đã bị chặn.',
     upstream_unavailable: 'Nguồn video đang tạm không phản hồi. Hãy thử lại sau.',
     resolver_unavailable: 'Máy chủ tải video đang tạm không phản hồi. Hãy thử lại sau.',
+    resolver_timeout: 'Máy chủ tải video phản hồi quá chậm. Hãy thử lại sau.',
+    busy: 'Máy chủ đang bận, bỏ qua việc tải trước.',
+    superseded: 'Đã bỏ qua vì có yêu cầu mới hơn.',
   };
   return messages[code] || 'Không thể chuẩn bị video để tải. Hãy thử lại sau.';
 }
@@ -116,19 +118,31 @@ async function __resolveDownloadViaServer(videoUrl) {
   if (!__validTikTokVideoUrl(videoUrl)) throw __resolverError('invalid_video_url');
   const proof = await getDownloadResolverProof();
   if (!proof) throw __licenseRequiredError();
-  const response = await fetch(__downloadResolverEndpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      license_data: proof.license_data,
-      license_signature: proof.license_signature,
-      video_url: String(videoUrl),
-    }).toString(),
-    credentials: 'omit',
-    cache: 'no-store',
-  });
+  // The shared host can hang or refuse: give every attempt a time limit and report a network failure with a code the
+  // scheduler below knows how to retry (before, a failed fetch escaped as a bare TypeError and a hang had no end).
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), __RESOLVE_ATTEMPT_TIMEOUT_MS);
+  let response;
   let payload = null;
-  try { payload = await response.json(); } catch {}
+  try {
+    response = await fetch(__downloadResolverEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        license_data: proof.license_data,
+        license_signature: proof.license_signature,
+        video_url: String(videoUrl),
+      }).toString(),
+      credentials: 'omit',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    try { payload = await response.json(); } catch {}
+  } catch {
+    throw __resolverError(controller.signal.aborted ? 'resolver_timeout' : 'resolver_unavailable');
+  } finally {
+    clearTimeout(timer);
+  }
   if (!response.ok || !payload || payload.success !== true || !payload.data || typeof payload.data.videoUrl !== 'string') {
     throw __resolverError(payload && typeof payload.code === 'string' ? payload.code : 'resolver_unavailable');
   }
@@ -163,19 +177,396 @@ async function __resolveProfileShopViaServer(username) {
   };
 }
 
-async function __resolveDownloadShared(videoUrl) {
-  const key = String(videoUrl || '');
-  if (__resolverInflight.has(key)) return __resolverInflight.get(key);
-  const pending = __resolveDownloadViaServer(key).finally(() => __resolverInflight.delete(key));
-  __resolverInflight.set(key, pending);
-  return pending;
+// ===== [Download] Resolver scheduler =====
+// Hover preview, Picture-in-Picture, the player window and the prefetch loop all end in one POST to the shared resolver
+// host, which resolves through a free upstream API that allows about 1 request per second. These requests used to leave
+// the extension all at once (a sweep of the mouse over the grid, the prefetch loop, a click, a new player window,
+// several tabs) and nothing retried a refusal, so most of them failed. They now go through this queue:
+//  - request starts are RESOLVE_GAP_MS apart and at most RESOLVE_MAX_ACTIVE are in flight; a click (priority 0) goes
+//    before a hover preview (1), which goes before the background prefetch (2); hover previews that have not started
+//    yet are dropped when the pointer has moved on to newer cards;
+//  - a refusal or a time-out of the shared host is retried with a short back-off, inside the caller's deadline;
+//  - a resolved stream is kept RESOLVE_CACHE_MS, also across service-worker restarts, so a new player window or another
+//    tab for the same video does not ask the server again. The signed license proof is checked before the cache or the
+//    queue are used, so a key that is no longer valid gets nothing from them.
+// Each attempt is logged in the service-worker console as "[TVT resolver]"; the totals are in __tvtResolverStats.
+const __RESOLVE_GAP_MS = 1100;
+const __RESOLVE_MAX_ACTIVE = 2;
+const __RESOLVE_ATTEMPT_TIMEOUT_MS = 8000;
+const __RESOLVE_DEADLINE_MS = 22000;
+const __RESOLVE_RETRIES = [3, 1, 0];         // retries after the first attempt, by priority (click, hover, prefetch)
+const __RESOLVE_WAITING_MAX = [0, 2, 2];     // jobs that may wait, by priority (0 = no limit)
+const __RESOLVE_CACHE_MS = 10 * 60 * 1000;
+const __RESOLVE_CACHE_MAX = 200;
+const __RESOLVE_CACHE_PREFIX = 'tvt_rc_';
+const __RESOLVE_TRANSIENT = new Set(['upstream_unavailable', 'resolver_unavailable', 'resolver_timeout']);
+const __RESOLVE_GAP_MAX_MS = 6000;         // the start spacing grows up to this while the host / upstream keeps refusing
+const __RESOLVE_COOL_MS = 10000;           // background prefetch stays quiet this long after a refusal
+const __resolveJobs = new Map();             // video id -> job that is waiting or running
+const __resolveWaiting = [];                 // jobs that have not (re)started yet
+const __resolveCache = new Map();            // video id -> { at, data }
+const __resolveStats = { ok: 0, retry: 0, fail: 0, cached: 0, page: 0, gap: __RESOLVE_GAP_MS, codes: {} };
+let __resolveActive = 0;
+let __resolveLastStart = 0;
+let __resolveTimer = 0;
+let __resolveSeq = 0;
+let __resolveGapMs = __RESOLVE_GAP_MS;     // current spacing of request starts (see __resolveAdapt)
+let __resolveCoolUntil = 0;                // no background prefetch before this time
+try { globalThis.__tvtResolverStats = __resolveStats; } catch {}
+
+function __resolveKey(videoUrl) {
+  const match = String(videoUrl || '').match(/\/video\/(\d{6,32})/);
+  return match ? match[1] : String(videoUrl || '');
 }
 
-async function __serverMetadata(videoUrl) {
+function __resolveLog(kind, job, took, code) {
   try {
-    return { success: true, data: await __resolveDownloadShared(videoUrl) };
+    console.info('[TVT resolver]', kind, 'prio=' + job.priority, 'try=' + job.attempts, took + 'ms', code || '', 'waiting=' + __resolveWaiting.length, 'gap=' + __resolveGapMs + 'ms');
+  } catch {}
+}
+
+// The cached stream did not play (the page asked again with refresh): forget it everywhere, so the next answer is new.
+async function __resolveCacheDrop(key) {
+  __resolveCache.delete(key);
+  try { await chrome.storage.session.remove(__RESOLVE_CACHE_PREFIX + key); } catch {}
+}
+
+// The host and its free upstream refuse more requests the harder they are pushed: after a refusal the spacing of the
+// request starts grows (x1.5, at least 2 s, at most RESOLVE_GAP_MAX_MS) and background prefetch pauses; every success
+// shortens the spacing again, step by step, down to RESOLVE_GAP_MS.
+function __resolveAdapt(ok) {
+  if (ok) {
+    __resolveGapMs = Math.max(__RESOLVE_GAP_MS, Math.round(__resolveGapMs * 0.8));
+  } else {
+    __resolveGapMs = Math.min(__RESOLVE_GAP_MAX_MS, Math.max(2000, Math.round(__resolveGapMs * 1.5)));
+    __resolveCoolUntil = Date.now() + __RESOLVE_COOL_MS;
+  }
+  __resolveStats.gap = __resolveGapMs;
+}
+
+async function __resolveCacheGet(key) {
+  const now = Date.now();
+  const mem = __resolveCache.get(key);
+  if (mem) {
+    if (now - mem.at < __RESOLVE_CACHE_MS) return mem.data;
+    __resolveCache.delete(key);
+  }
+  try {
+    const storeKey = __RESOLVE_CACHE_PREFIX + key;
+    const stored = (await chrome.storage.session.get(storeKey))[storeKey];
+    if (stored && Number.isFinite(stored.at) && now - stored.at < __RESOLVE_CACHE_MS && stored.data && typeof stored.data.videoUrl === 'string') {
+      __resolveCache.set(key, stored);
+      return stored.data;
+    }
+  } catch {}
+  return null;
+}
+
+function __resolveCachePut(key, data) {
+  const entry = { at: Date.now(), data };
+  __resolveCache.set(key, entry);
+  while (__resolveCache.size > __RESOLVE_CACHE_MAX) {
+    const oldest = __resolveCache.keys().next().value;
+    __resolveCache.delete(oldest);
+    try { chrome.storage.session.remove(__RESOLVE_CACHE_PREFIX + oldest).catch(() => {}); } catch {}
+  }
+  try { chrome.storage.session.set({ [__RESOLVE_CACHE_PREFIX + key]: entry }).catch(() => {}); } catch {}
+}
+
+// Every wake-up of the worker: forget the persisted streams that have expired.
+(async () => {
+  try {
+    const all = await chrome.storage.session.get(null);
+    const now = Date.now();
+    const stale = Object.keys(all).filter((storeKey) => storeKey.startsWith(__RESOLVE_CACHE_PREFIX)
+      && !(all[storeKey] && Number.isFinite(all[storeKey].at) && now - all[storeKey].at < __RESOLVE_CACHE_MS));
+    if (stale.length) await chrome.storage.session.remove(stale);
+  } catch {}
+})();
+
+// ===== [Download] Page streams =====
+// Hover preview, Picture-in-Picture and the player window only PLAY a video. TikTok has already sent the browser the
+// stream of every video it lists (the JSON of its own API calls): tiktok-hook.js finds those streams and
+// tiktok-loader.js passes them on here (message TVT_PAGE_STREAMS). A playback request (GET_TIKTOK_METADATA with
+// playback: true) is answered from them before the shared resolver is asked, so it needs no round trip to the server
+// and does not use up the quota of the free upstream API. Downloads never use them. A stream that did not play (the
+// page asked again with refresh: true) is dropped and not used again for PAGE_STREAM_BAD_MS: that request, and the ones
+// after it for the same video, go to the resolver as before.
+// The entries are kept in memory and in chrome.storage.session (the worker is stopped after a short idle time).
+// Totals: __tvtResolverStats.page (playback requests answered from a page stream).
+const __PAGE_STREAM_PREFIX = 'tvt_ps_';
+const __PAGE_STREAM_MAX = 500;
+const __PAGE_STREAM_TTL_DEFAULT_MS = 20 * 60 * 1000;   // when the URL does not say when it expires
+const __PAGE_STREAM_TTL_MAX_MS = 30 * 60 * 1000;
+const __PAGE_STREAM_SAFETY_MS = 2 * 60 * 1000;         // stop using a stream this long before its own expiry
+const __PAGE_STREAM_MIN_MS = 60 * 1000;                // a stream that expires sooner is not worth keeping
+const __PAGE_STREAM_BAD_MS = 30 * 60 * 1000;
+const __pageStreams = new Map();                       // video id -> { at, ttl, data }
+const __pageStreamBad = new Map();                     // video id -> when its stream failed to play
+
+function __pageStreamTtl(videoUrl) {
+  try {
+    const params = new URL(videoUrl).searchParams;
+    const expire = Number(params.get('expire') || params.get('x-expires'));
+    if (Number.isFinite(expire) && expire > 1e9 && expire < 1e11) {
+      return Math.min(__PAGE_STREAM_TTL_MAX_MS, expire * 1000 - Date.now() - __PAGE_STREAM_SAFETY_MS);
+    }
+  } catch {}
+  return __PAGE_STREAM_TTL_DEFAULT_MS;
+}
+
+function __pageStreamHttps(value, max) {
+  if (typeof value !== 'string' || value.length > max) return '';
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password ? value : '';
+  } catch {
+    return '';
+  }
+}
+
+function __pageStreamClean(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = String(raw.id || '');
+  const videoUrl = __pageStreamHttps(raw.videoUrl, 4096);
+  if (!/^\d{6,32}$/.test(id) || !videoUrl) return null;
+  const text = (value, max) => (typeof value === 'string' ? value.slice(0, max) : '');
+  return {
+    id,
+    data: { videoUrl, coverUrl: __pageStreamHttps(raw.coverUrl, 4096), title: text(raw.title, 300), author: text(raw.author, 64) },
+  };
+}
+
+function __pageStreamPut(list) {
+  const now = Date.now();
+  const batch = {};
+  for (const raw of Array.isArray(list) ? list : []) {
+    const clean = __pageStreamClean(raw);
+    if (!clean) continue;
+    const badAt = __pageStreamBad.get(clean.id);
+    if (badAt && now - badAt < __PAGE_STREAM_BAD_MS) continue;
+    const ttl = __pageStreamTtl(clean.data.videoUrl);
+    if (ttl < __PAGE_STREAM_MIN_MS) continue;
+    const entry = { at: now, ttl, data: clean.data };
+    __pageStreams.delete(clean.id);
+    __pageStreams.set(clean.id, entry);
+    batch[__PAGE_STREAM_PREFIX + clean.id] = entry;
+  }
+  const stale = [];
+  while (__pageStreams.size > __PAGE_STREAM_MAX) {
+    const oldest = __pageStreams.keys().next().value;
+    __pageStreams.delete(oldest);
+    stale.push(__PAGE_STREAM_PREFIX + oldest);
+  }
+  try {
+    if (Object.keys(batch).length) chrome.storage.session.set(batch).catch(() => {});
+    if (stale.length) chrome.storage.session.remove(stale).catch(() => {});
+  } catch {}
+}
+
+async function __pageStreamGet(key) {
+  const now = Date.now();
+  const mem = __pageStreams.get(key);
+  if (mem) {
+    if (now - mem.at < mem.ttl) return mem.data;
+    __pageStreams.delete(key);
+    return null;
+  }
+  try {
+    const storeKey = __PAGE_STREAM_PREFIX + key;
+    const stored = (await chrome.storage.session.get(storeKey))[storeKey];
+    if (stored && Number.isFinite(stored.at) && Number.isFinite(stored.ttl) && now - stored.at < stored.ttl
+      && stored.data && typeof stored.data.videoUrl === 'string') {
+      __pageStreams.set(key, stored);
+      return stored.data;
+    }
+  } catch {}
+  return null;
+}
+
+// failed: the stream did not play, so the same one must not be handed out again for a while.
+async function __pageStreamDrop(key, failed) {
+  __pageStreams.delete(key);
+  if (failed === true) {
+    const now = Date.now();
+    for (const [id, at] of __pageStreamBad) {
+      if (now - at >= __PAGE_STREAM_BAD_MS) __pageStreamBad.delete(id);
+    }
+    __pageStreamBad.set(key, now);
+  }
+  try { await chrome.storage.session.remove(__PAGE_STREAM_PREFIX + key); } catch {}
+}
+
+// Every wake-up of the worker: forget the persisted page streams that have expired.
+(async () => {
+  try {
+    const all = await chrome.storage.session.get(null);
+    const now = Date.now();
+    const stale = Object.keys(all).filter((storeKey) => storeKey.startsWith(__PAGE_STREAM_PREFIX)
+      && !(all[storeKey] && Number.isFinite(all[storeKey].at) && Number.isFinite(all[storeKey].ttl) && now - all[storeKey].at < all[storeKey].ttl));
+    if (stale.length) await chrome.storage.session.remove(stale);
+  } catch {}
+})();
+
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (!message || message.type !== 'TVT_PAGE_STREAMS') return false;
+  try {
+    if (!sender || sender.id !== chrome.runtime.id || !sender.tab) return false;
+    if (!/(^|\.)tiktok\.com$/i.test(new URL(String(sender.url || sender.tab.url || '')).hostname)) return false;
+    if (Array.isArray(message.streams)) __pageStreamPut(message.streams.slice(0, 60));
+  } catch {}
+  return false;
+});
+// ===== [/Download] Page streams =====
+
+function __resolveFinish(job, data, error) {
+  if (__resolveJobs.get(job.key) === job) __resolveJobs.delete(job.key);
+  if (error) job.reject(error);
+  else job.resolve(data);
+}
+
+// The pointer moves on faster than the server answers: of the hover / prefetch jobs that have not started, keep the
+// newest few and refuse the rest at once (the page does not wait for them any more).
+function __resolveTrimWaiting() {
+  for (const priority of [1, 2]) {
+    const mine = __resolveWaiting.filter((job) => job.priority === priority && job.attempts === 0);
+    while (mine.length > __RESOLVE_WAITING_MAX[priority]) {
+      const dropped = mine.shift();
+      __resolveWaiting.splice(__resolveWaiting.indexOf(dropped), 1);
+      __resolveFinish(dropped, null, __resolverError('superseded'));
+    }
+  }
+}
+
+// Next job to start: the most urgent one that is ready; a hover preview goes newest first, everything else oldest first.
+function __resolvePick(now) {
+  let best = -1;
+  for (let i = 0; i < __resolveWaiting.length; i++) {
+    const job = __resolveWaiting[i];
+    if (job.notBefore > now) continue;
+    if (best < 0) { best = i; continue; }
+    const other = __resolveWaiting[best];
+    if (job.priority < other.priority) best = i;
+    else if (job.priority === other.priority && (job.priority === 1 ? job.seq > other.seq : job.seq < other.seq)) best = i;
+  }
+  return best;
+}
+
+function __resolvePump() {
+  if (__resolveTimer) { clearTimeout(__resolveTimer); __resolveTimer = 0; }
+  for (;;) {
+    const now = Date.now();
+    for (let i = __resolveWaiting.length - 1; i >= 0; i--) {
+      if (__resolveWaiting[i].deadline > now) continue;
+      const expired = __resolveWaiting.splice(i, 1)[0];
+      __resolveFinish(expired, null, expired.lastError || __resolverError('resolver_timeout'));
+    }
+    if (!__resolveWaiting.length || __resolveActive >= __RESOLVE_MAX_ACTIVE) return;   // a finishing job pumps again
+    let readyAt = Infinity;
+    for (const job of __resolveWaiting) readyAt = Math.min(readyAt, job.notBefore);
+    const startAt = Math.max(__resolveLastStart + __resolveGapMs, readyAt);
+    if (startAt > now) { __resolveTimer = setTimeout(__resolvePump, startAt - now + 5); return; }
+    const job = __resolveWaiting.splice(__resolvePick(now), 1)[0];
+    __resolveLastStart = now;
+    __resolveActive++;
+    __resolveRun(job);
+  }
+}
+
+async function __resolveRun(job) {
+  job.attempts++;
+  const startedAt = Date.now();
+  let data = null;
+  let failure = null;
+  try {
+    data = await __resolveDownloadViaServer(job.url);
   } catch (error) {
-    return { success: false, error: __resolverMessage((error && error.code) || (error && error.message)) };
+    failure = error;
+  }
+  __resolveActive--;
+  const took = Date.now() - startedAt;
+  if (data) {
+    __resolveCachePut(job.key, data);
+    __resolveStats.ok++;
+    __resolveAdapt(true);
+    __resolveLog('ok', job, took, '');
+    __resolveFinish(job, data, null);
+  } else {
+    const code = String((failure && (failure.code || failure.message)) || 'resolver_unavailable');
+    job.lastError = failure || __resolverError(code);
+    __resolveStats.codes[code] = (__resolveStats.codes[code] || 0) + 1;
+    if (__RESOLVE_TRANSIENT.has(code)) __resolveAdapt(false);
+    const delay = 900 * job.attempts + Math.floor(Math.random() * 400);
+    const again = __RESOLVE_TRANSIENT.has(code)
+      && job.attempts <= __RESOLVE_RETRIES[job.priority]
+      && Date.now() + delay + 1500 < job.deadline;
+    if (again) {
+      __resolveStats.retry++;
+      __resolveLog('retry', job, took, code);
+      job.notBefore = Date.now() + delay;
+      __resolveWaiting.push(job);
+    } else {
+      __resolveStats.fail++;
+      __resolveLog('fail', job, took, code);
+      __resolveFinish(job, null, job.lastError);
+    }
+  }
+  __resolvePump();
+}
+
+// priority: 0 = a click or a player window (default), 1 = hover preview, 2 = background prefetch.
+// refresh: the stream this page got before did not play - skip (and forget) the cached one.
+// playback: the answer is only played (hover preview, PiP, player window), so a stream TikTok itself delivered to the page
+// (see "Page streams") may answer it. Downloads leave it out and always get a resolver stream.
+async function __resolveDownloadShared(videoUrl, priority, refresh, playback) {
+  const rawUrl = String(videoUrl || '');
+  if (!__validTikTokVideoUrl(rawUrl)) throw __resolverError('invalid_video_url');
+  if (!(await getDownloadResolverProof())) throw __licenseRequiredError();
+  const key = __resolveKey(rawUrl);
+  const wanted = priority === 1 || priority === 2 ? priority : 0;
+  if (refresh === true) await __resolveCacheDrop(key);
+  if (refresh === true && playback === true) await __pageStreamDrop(key, true);
+  if (playback === true) {
+    const page = await __pageStreamGet(key);
+    if (page) {
+      __resolveStats.page++;
+      return page;
+    }
+  }
+  const cached = await __resolveCacheGet(key);
+  if (cached) {
+    __resolveStats.cached++;
+    return cached;
+  }
+  const running = __resolveJobs.get(key);
+  if (running) {
+    if (wanted < running.priority) running.priority = wanted;   // someone needs it more than the queue knew
+    __resolvePump();
+    return running.promise;
+  }
+  // Background prefetch only uses idle time: it never queues behind (or in front of) what the person is waiting for,
+  // and it stays out of the way right after the host or the upstream has refused something.
+  if (wanted === 2 && (__resolveActive > 0 || __resolveWaiting.length > 0 || Date.now() < __resolveCoolUntil)) {
+    throw __resolverError('busy');
+  }
+  const job = { key, url: rawUrl, priority: wanted, seq: ++__resolveSeq, attempts: 0, notBefore: 0, lastError: null, deadline: Date.now() + __RESOLVE_DEADLINE_MS };
+  job.promise = new Promise((resolve, reject) => { job.resolve = resolve; job.reject = reject; });
+  __resolveJobs.set(key, job);
+  __resolveWaiting.push(job);
+  __resolveTrimWaiting();
+  __resolvePump();
+  return job.promise;
+}
+// ===== [/Download] Resolver scheduler =====
+
+async function __serverMetadata(videoUrl, priority, refresh, playback) {
+  try {
+    return { success: true, data: await __resolveDownloadShared(videoUrl, priority, refresh, playback) };
+  } catch (error) {
+    const code = (error && error.code) || (error && error.message);
+    // The code stays in the text: the player window and the console show it, so a failure can be told apart
+    // (server unreachable / upstream refused / key problem) without opening the service-worker console.
+    return { success: false, error: __resolverMessage(code) + (code ? ' [' + code + ']' : '') };
   }
 }
 
@@ -206,7 +597,7 @@ async function __serverProfileShop(username) {
     return { success: false, shopVideoIds: [], totalScanned: 0, error: __resolverMessage((error && error.code) || (error && error.message)) };
   }
 }
-const ot=(...t)=>{};chrome.runtime.onMessage.addListener((t,e,s)=>{switch(t.type){case"TIKTOK_DOWNLOAD":return __serverDownload(t.url,t.filename).then(s),!0;case"GET_TIKTOK_METADATA":return __serverMetadata(t.url).then(s),!0;case"__DOWNLOAD_MULTI_FETCH_BYTES__":return __fetchBytesForChosenFolder(t.url).then(s),!0;case"GET_DOWNLOADDUCT":return Lt(t.url,t.strongSignal===!0).then(s),!0;case"OPEN_PRODUCT_TAB":{const r=String(t.url||"");return/^https:\/\/(www\.)?tiktok\.com\//i.test(r)||/^https:\/\/vm\.tiktok\.com\//i.test(r)?(chrome.tabs.create({url:r,active:!0}).catch(c=>ot("[BG] open tab fail:",c)),!1):(ot("[BG] OPEN_PRODUCT_TAB rejected non-TikTok URL:",r.slice(0,80)),!1)}case"GET_TIKTOK_PDP_INFO":return At(t.url).then(s),!0;case"GET_PROFILE_SHOP_VIDEOS":return __serverProfileShop(t.username).then(s),!0;default:return!1}});async function __getAskWhereToSave(){try{const r=await chrome.storage.local.get("askWhereToSave");return r&&r.askWhereToSave===!0}catch{return!1}}function wt(t,e,s){const r=(t||"tiktok").trim(),a=(e||"").trim(),c=a?r+" - "+a:r+" - "+s;return Gt(c)+".mp4"}const lt=new Map,J=new Map,bt=5*60*1e3;async function At(t){if(!t||!/\/shop\/[^/]+\/pdp\//.test(t))return{success:!1,error:"not_a_pdp_url"};const e=(t.match(/^https?:\/\/[^/]+\/shop\/[^/]+\/pdp\/[^/]+\/\d+/)||[t])[0];try{const s=lt.get(e);if(s&&Date.now()-s.ts<bt)return{success:!0,data:s.info};const r=J.get(e);if(r)return{success:!0,data:await r};const a=ct(e).then(l=>(lt.set(e,{info:l,ts:Date.now()}),J.delete(e),l)).catch(l=>{throw J.delete(e),l});return J.set(e,a),{success:!0,data:await a}}catch(s){return{success:!1,error:s.message}}}async function ct(t){var a,c;await nt();const e=await fetch(t,{method:"GET",credentials:"include",redirect:"follow",headers:{Accept:"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"vi-VN,vi;q=0.9,en;q=0.8"}});if(!e.ok)throw new Error(`PDP fetch ${e.status}`);const s=await e.text(),r=((c=(a=s.match(/<title[^>]*>([^<]+)<\/title>/))==null?void 0:a[1])==null?void 0:c.trim())||"";if(/^(security check|please verify|verify to continue|please complete|access denied)$/i.test(r)||/captcha|secsdk-captcha|verify[-_]?modal/i.test(s.slice(0,5e3)))throw new Error("pdp_captcha_or_rate_limited");return Pt(s)}function K(t,e,s=0){const r=`"${e}":`;let a=s;for(;a<t.length;){const c=t.indexOf(r,a);if(c<0)return null;const l=t.indexOf("{",c+r.length);if(l<0)return null;let u=0,d=!1,m=!1;const S=Math.min(t.length,l+2e5);for(let A=l;A<S;A++){const y=t[A];if(m){m=!1;continue}if(y==="\\"&&d){m=!0;continue}if(y==='"'){d=!d;continue}if(!d){if(y==="{")u++;else if(y==="}"&&(u--,u===0))try{return{obj:JSON.parse(t.slice(l,A+1)),endIdx:A+1}}catch{break}}}a=l+1}return null}function Pt(t){var I,f,p,w,T,D,L,C,R,O,F,E,V,G,$,M,v;const e={},s=K(t,"product_model"),r=s==null?void 0:s.obj,a=(s==null?void 0:s.endIdx)??0,c=K(t,"price_info",a),l=K(t,"rating_info",a),u=K(t,"default_sku",a),d=K(t,"sku_list",a);if(r&&typeof r=="object"){if(!e.title){const i=r.name||r.title||r.product_name||r.product_title||r.display_name;i&&(e.title=String(i).slice(0,200))}if(!e.soldCount&&r.sold_count!==void 0&&r.sold_count!==0&&r.sold_count!=="0"&&(e.soldCount=String(r.sold_count)),!e.imageUrl){const i=((p=(f=(I=r.main_images)==null?void 0:I[0])==null?void 0:f.url_list)==null?void 0:p[0])||((D=(T=(w=r.images)==null?void 0:w[0])==null?void 0:T.url_list)==null?void 0:D[0])||r.cover_url||((C=(L=r.cover)==null?void 0:L.url_list)==null?void 0:C[0]);i&&(e.imageUrl=String(i))}}if(!e.title){const i=K(t,"product_info"),o=i==null?void 0:i.obj;if(o&&typeof o=="object"){const _=o.title||o.name||o.product_name||o.product_title;_&&(e.title=String(_).slice(0,200))}}if(!e.title){const i=t.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i)||t.match(/<meta\s+content=["']([^"']+)["']\s+property=["']og:title["']/i);if(i!=null&&i[1]){let o=i[1].trim();o=o.replace(/\s*[\|·\-–—]\s*(TikTok Shop|TikTok)\s*$/i,"").trim(),o&&o.length>3&&(e.title=o.slice(0,200))}}if(!e.title){const i=t.match(/<title[^>]*>([^<]+)<\/title>/);if(i!=null&&i[1]){let o=i[1].trim();o=o.replace(/\s*[\|·\-–—]\s*(TikTok Shop|TikTok)\s*$/i,"").trim(),o&&o.length>3&&!/^(TikTok|TikTok Shop|Login|Verify)$/i.test(o)&&(e.title=o.slice(0,200))}}if(!e.title){const i=/"(?:product_name|product_title|elastic_title)"\s*:\s*"([^"\\]{4,200})"/,o=t.match(i);o!=null&&o[1]&&(e.title=o[1].slice(0,200))}const m=[c==null?void 0:c.obj,r==null?void 0:r.price_info,r==null?void 0:r.priceInfo,u==null?void 0:u.obj,r==null?void 0:r.default_sku].filter(Boolean);for(const i of m){if(e.price)break;if(e.price=i.format_price||i.price_str||i.price||i.sale_price_str||i.sale_price||i.current_price_str||i.current_price||i.real_price_str||i.real_price,!e.originalPrice){const o=i.market_price_str||i.market_price||i.origin_price_str||i.origin_price||i.list_price_str||i.list_price;o&&o!==e.price&&o!==0&&o!=="0"&&(e.originalPrice=String(o))}}if(!e.price&&(d!=null&&d.obj)){const i=Array.isArray(d.obj)?d.obj:Array.isArray(d.obj.skus)?d.obj.skus:Array.isArray(d.obj.list)?d.obj.list:[];for(const o of i){if(!o||typeof o!="object")continue;const _=o.format_price||o.price_str||o.price||o.sale_price_str||o.sale_price||((R=o.price_info)==null?void 0:R.format_price)||((O=o.price_info)==null?void 0:O.price);if(_&&_!==0&&_!=="0"){e.price=String(_);break}}}if(!e.price&&r&&Array.isArray(r.skus))for(const i of r.skus){if(!i||typeof i!="object")continue;const o=i.format_price||i.price_str||i.price||i.sale_price_str||i.sale_price||((F=i.price_info)==null?void 0:F.format_price)||((E=i.price_info)==null?void 0:E.price);if(o&&o!==0&&o!=="0"){e.price=String(o);break}}if(e.price&&/^\d+$/.test(String(e.price))){const i=Number(e.price);Number.isFinite(i)&&i>=1e3&&(e.price=`đ${i.toLocaleString("vi-VN")}`)}if(e.originalPrice&&/^\d+$/.test(String(e.originalPrice))){const i=Number(e.originalPrice);Number.isFinite(i)&&i>=1e3&&(e.originalPrice=`đ${i.toLocaleString("vi-VN")}`)}if(e.price&&/^[đ₫]?0+$/.test(String(e.price).replace(/[.,\s]/g,""))&&(e.price=void 0),!e.price){const i=(V=t.match(/"sale_price_format"\s*:\s*"([^"]+)"/))==null?void 0:V[1],o=(G=t.match(/"origin_price_format"\s*:\s*"([^"]+)"/))==null?void 0:G[1],_=(($=t.match(/"price_prefix"\s*:\s*"([^"]+)"/))==null?void 0:$[1])||"",k=/["']?(VND|VNĐ)["']?/i.test(t.slice(0,2e5)),g=!_||/^(t[ưừ]|from)$/i.test(_.trim())?k?"₫":"đ":_;i&&i!=="0"&&(e.price=`${g}${i}`),!e.originalPrice&&o&&o!==i&&o!=="0"&&(e.originalPrice=`${g}${o}`)}if(!e.price){const i=(M=t.match(/"sale_price_decimal"\s*:\s*"?(\d+)"?/))==null?void 0:M[1],o=(v=t.match(/"origin_price_decimal"\s*:\s*"?(\d+)"?/))==null?void 0:v[1];if(i&&i!=="0"){const _=Number(i);Number.isFinite(_)&&_>=1e3&&(e.price=`đ${_.toLocaleString("vi-VN")}`)}if(!e.originalPrice&&o&&o!=="0"&&o!==i){const _=Number(o);Number.isFinite(_)&&_>=1e3&&(e.originalPrice=`đ${_.toLocaleString("vi-VN")}`)}}if(!e.price){const i=[],o=/(?:đ|₫|\\u0111|\\u20ab)([\d.]+)/gi;let _;for(;(_=o.exec(t))!==null;){const k=Number(_[1].replace(/\./g,""));if(Number.isFinite(k)&&k>=1e3&&k<=1e9&&i.push(k),i.length>200)break}if(i.length){const k=new Map;for(const P of i)k.set(P,(k.get(P)??0)+1);const n=[...k.entries()].sort((P,x)=>x[1]-P[1]).slice(0,2).map(P=>P[0]).sort((P,x)=>P-x);n[0]&&(e.price=`đ${n[0].toLocaleString("vi-VN")}`,n[1]&&n[1]>n[0]&&(e.originalPrice=`đ${n[1].toLocaleString("vi-VN")}`))}}if(!e.rating){const i=t.match(/"product_overall_score"\s*:\s*"?([\d.]+)"?/)||t.match(/"product_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"average_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"avg_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"avg_rate"\s*:\s*"?([\d.]+)"?/)||t.match(/"product_rate"\s*:\s*"?([\d.]+)"?/)||t.match(/"rating_value"\s*:\s*"?([\d.]+)"?/)||t.match(/"score"\s*:\s*([\d.]+)/)||t.match(/"rating"\s*:\s*([\d.]+)/);i!=null&&i[1]&&i[1]!=="0"&&i[1]!=="0.0"&&(e.rating=i[1])}if(!e.reviewCount){const i=t.match(/"product_review_count"\s*:\s*"?(\d+)"?/)||t.match(/"review_count"\s*:\s*"?(\d+)"?/)||t.match(/"rating_count"\s*:\s*"?(\d+)"?/)||t.match(/"total_reviews"\s*:\s*"?(\d+)"?/)||t.match(/"comments_count"\s*:\s*"?(\d+)"?/);i!=null&&i[1]&&i[1]!=="0"&&(e.reviewCount=i[1])}const S=[l==null?void 0:l.obj,r==null?void 0:r.rating_info,r==null?void 0:r.ratingInfo,r==null?void 0:r.product_rating_info].filter(Boolean);for(const i of S){if(e.rating&&e.reviewCount)break;if(!e.rating){const o=i.rating||i.product_rating||i.average_rating||i.rating_value;o!==void 0&&o!==0&&o!=="0"&&o!=="0.0"&&(e.rating=String(o))}if(!e.reviewCount){const o=i.review_count||i.rating_count||i.product_rating_count;o!==void 0&&o!==0&&o!=="0"&&(e.reviewCount=String(o))}}!e.rating&&(r!=null&&r.product_rating)&&(e.rating=String(r.product_rating)),!e.reviewCount&&(r!=null&&r.review_count)&&(e.reviewCount=String(r.review_count));const A=t.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/g)||[];for(const i of A){const o=i.replace(/^<script[^>]*>/,"").replace(/<\/script>$/,"").trim();try{const _=JSON.parse(o),k=Array.isArray(_)?_:[_];for(const g of k){if(!g||typeof g!="object")continue;const n=g["@type"];if(n==="Product"||n==="product"||Array.isArray(n)&&n.includes("Product")){const P=g.offers,x=Array.isArray(P)?P:P?[P]:[];for(const b of x){if(!e.price){const U=b.price||b.lowPrice,q=b.priceCurrency||b.currency;U&&(e.price=Q(U,q))}!e.originalPrice&&b.highPrice&&b.highPrice!==b.lowPrice&&(e.originalPrice=Q(b.highPrice,b.priceCurrency))}const N=g.aggregateRating;if(N&&(!e.rating&&N.ratingValue!==void 0&&(e.rating=String(N.ratingValue)),!e.reviewCount&&(N.reviewCount!==void 0||N.ratingCount!==void 0)&&(e.reviewCount=String(N.reviewCount??N.ratingCount))),!e.description&&g.description&&(e.description=String(g.description).slice(0,600)),!e.imageUrl){const b=g.image;typeof b=="string"?e.imageUrl=b:Array.isArray(b)&&typeof b[0]=="string"&&(e.imageUrl=b[0])}}}}catch{}}if(!e.price){const i=t.match(/<meta[^>]+property=["']og:price:amount["'][^>]+content=["']([^"']+)["']/i)||t.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:price:amount["']/i),o=t.match(/<meta[^>]+property=["']og:price:currency["'][^>]+content=["']([^"']+)["']/i)||t.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:price:currency["']/i);i!=null&&i[1]&&(e.price=Q(i[1],o==null?void 0:o[1]))}const y=i=>i.replace(/\\u0111/gi,"đ").replace(/\\u20ab/gi,"₫").replace(/\\u20AB/gi,"₫");if(!e.price){const i=t.match(/"price_str"\s*:\s*"([^"]+)"/)||t.match(/"format_price"\s*:\s*"([^"]+)"/)||t.match(/"sale_price_str"\s*:\s*"([^"]+)"/)||t.match(/"discount_price_str"\s*:\s*"([^"]+)"/)||t.match(/"current_price_str"\s*:\s*"([^"]+)"/);if(i!=null&&i[1]){const o=y(i[1]);o.replace(/[^\d]/g,"").replace(/^0+$/,"")&&(e.price=o)}}if(!e.price){const i=t.match(/"sale_price"\s*:\s*(\d{4,})/)||t.match(/"current_price"\s*:\s*(\d{4,})/)||t.match(/"real_price"\s*:\s*(\d{4,})/)||t.match(/"product_price"\s*:\s*(\d{4,})/);if(i!=null&&i[1]){const o=Number(i[1]);Number.isFinite(o)&&o>0&&(e.price=`đ${o.toLocaleString("vi-VN")}`)}}if(!e.originalPrice){const i=t.match(/"market_price_str"\s*:\s*"([^"]+)"/)||t.match(/"original_price_str"\s*:\s*"([^"]+)"/)||t.match(/"list_price_str"\s*:\s*"([^"]+)"/);if(i!=null&&i[1]){const o=y(i[1]);o.replace(/[^\d]/g,"").replace(/^0+$/,"")&&(e.originalPrice=o)}}if(!e.originalPrice){const i=t.match(/"market_price"\s*:\s*(\d{4,})/)||t.match(/"original_price"\s*:\s*(\d{4,})/);if(i!=null&&i[1]){const o=Number(i[1]);Number.isFinite(o)&&o>0&&(e.originalPrice=`đ${o.toLocaleString("vi-VN")}`)}}if(!e.soldCount){const i=t.match(/"sold_count"\s*:\s*"?(\d[\d,.kKmM]*)"?/)||t.match(/"sales_count"\s*:\s*"?(\d[\d,.kKmM]*)"?/)||t.match(/"sold"\s*:\s*"?(\d[\d,.kKmM]+)"?/);i!=null&&i[1]&&i[1]!=="0"&&(e.soldCount=i[1])}if(!e.rating){const i=t.match(/"product_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"average_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"rating_value"\s*:\s*"?([\d.]+)"?/)||t.match(/"score"\s*:\s*"?([\d.]+)"?[\s,}]/);i!=null&&i[1]&&i[1]!=="0"&&i[1]!=="0.0"&&(e.rating=i[1])}if(!e.reviewCount){const i=t.match(/"review_count"\s*:\s*"?(\d+)"?/)||t.match(/"rating_count"\s*:\s*"?(\d+)"?/)||t.match(/"product_rating_count"\s*:\s*"?(\d+)"?/);i!=null&&i[1]&&i[1]!=="0"&&(e.reviewCount=i[1])}const h=[];if(/HÀNG\s*VIỆT|HANG_VIET|HangViet/.test(t)&&h.push("HÀNG VIỆT"),h.length&&(e.tags=h),!e.price||!e.rating){const i={},o=t.indexOf('"product_info":');if(o>=0){const x=t.indexOf("{",o);if(x>=0){const N=[];let b=0,U=!1,q=!1;const z=Math.min(t.length,x+5e4);for(let j=x;j<z&&N.length<25;j++){const B=t[j];if(q){q=!1;continue}if(B==="\\"&&U){q=!0;continue}if(B==='"'){if(U=!U,U&&b===1){const H=t.indexOf('"',j+1);if(H>j&&H-j<80){const st=t.slice(j+1,H);t.charAt(H+1)===":"&&!st.includes("\\")&&(N.push(st),j=H,U=!1)}}continue}if(!U){if(B==="{")b++;else if(B==="}"&&(b--,b===0))break}}i.product_info_top_keys=N}}const _=t.match(/đ[\d.,]+/g)||[],k=t.match(/\\u0111[\d.,]+/g)||[],g=t.match(/[\d.,]+\s*₫/g)||[];i.dong_patterns=[..._.slice(0,6),...k.slice(0,6),...g.slice(0,6)];const n=t.match(/"[a-z_]*price[a-z_]*"\s*:\s*"?[^,"}\]]{1,40}/gi)||[];i.price_shaped_keys=n.filter(x=>!/:\s*"?0+"?/.test(x)).slice(0,15);const P=t.match(/"[a-z_]*(?:rate|rating|review|score|star)[a-z_]*"\s*:\s*"?[^,"}\]]{1,40}/gi)||[];i.rating_shaped_keys=P.filter(x=>!/:\s*"?0+"?/.test(x)).slice(0,15),i.found_price_info=t.indexOf('"price_info"')>=0,i.found_rating_info=t.indexOf('"rating_info"')>=0,i.found_default_sku=t.indexOf('"default_sku"')>=0,i.found_sku_list=t.indexOf('"sku_list"')>=0,i.found_sale_price_info=t.indexOf('"sale_price_info"')>=0,i.found_discount_info=t.indexOf('"discount_info"')>=0,e._debug=i}return e}function Q(t,e){if(t==null)return"";const s=typeof t=="number"?t:Number(String(t).replace(/[^\d.-]/g,""));if(!Number.isFinite(s)||s<=0)return"";const r=s.toLocaleString("vi-VN"),a=(e||"").toUpperCase()==="VND"?"đ":e||"";return a?`${a}${r}`:r}const gt="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",ut=9001;let dt=!1;async function nt(){if(!dt)try{await chrome.declarativeNetRequest.updateSessionRules({removeRuleIds:[ut],addRules:[{id:ut,priority:1,action:{type:"modifyHeaders",requestHeaders:[{header:"User-Agent",operation:"set",value:gt}]},condition:{urlFilter:"||tiktok.com/",resourceTypes:["xmlhttprequest","main_frame","sub_frame","other"],tabIds:[-1]}}]}),dt=!0}catch{}}async function It(t,e="include"){var p,w,T,D,L;await nt();const s=t.match(/\/video\/(\d+)/);if(!s)throw new Error("URL không có video ID");const r=s[1],a=t.match(/@([^/?#]+)/),l=`https://www.tiktok.com/@${a?a[1]:"_"}/video/${r}`,u=await fetch(l,{method:"GET",credentials:e,redirect:"follow",headers:{Accept:"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"vi-VN,vi;q=0.9,en;q=0.8"}});if(!u.ok)throw new Error(`Mobile fetch ${u.status}`);const d=await u.text(),m=((p=d.match(/<title[^>]*>([^<]+)<\/title>/))==null?void 0:p[1])||"";if(/^(security check|please verify|verify to continue|please complete|access denied)$/i.test(m.trim())||/captcha|secsdk-captcha|verify[-_]?modal/i.test(d.slice(0,5e3)))throw new Error("captcha_or_rate_limited");const S={htmlSize:d.length,titleTag:m.slice(0,120),hasCommerceProductInfoStr:d.includes("commerceProductInfo")||d.includes("commerce_product_info"),hasProductId:/"product_id"\s*:/.test(d),hasFormatPrice:/"format_price"\s*:/.test(d),hasAnchorType33:/"type"\s*:\s*33\b/.test(d),hasLoginWall:/login|verify|captcha|too many requests|redirect/i.test(m),htmlHead:d.slice(0,400)},A=d.match(/<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);if(!A)return{product:null,debug:{error:"no_universal_data_script",...S}};let y;try{y=JSON.parse(A[1])}catch(C){return{product:null,debug:{error:"parse_fail",msg:C.message,...S}}}const h=(D=(T=(w=y==null?void 0:y.__DEFAULT_SCOPE__)==null?void 0:w["webapp.video-detail"])==null?void 0:T.itemInfo)==null?void 0:D.itemStruct;if(!h){const C=d.match(/tiktok\.com\/shop\/[a-z]{2}\/pdp\/([^/"'\s\\)]+)\/(\d{6,})/i);if(C){const R=C[1],O=C[2],F=`https://www.tiktok.com/shop/vn/pdp/${R}/${O}`,E=[],V=d.match(/"elastic_title"\s*:\s*"([^"]{3,80})"/);V&&E.push({src:"elastic_title",text:V[1]});const G=/"keyword"\s*:\s*"([^"\\]{3,80})"/g;let $;for(;($=G.exec(d))!==null;){const n=$[1];if(!/capcut|edit like|editing made|template|effect|tiktok shop/i.test(n)&&(E.push({src:"keyword",text:n}),E.length>8))break}const M=/\\"keyword\\"\s*:\s*\\"([^"\\]{3,80})\\"/g;let v;for(;(v=M.exec(d))!==null;){const n=v[1];if(!/capcut|edit like|editing made|template|effect|tiktok shop/i.test(n)&&(E.push({src:"escaped_keyword",text:n}),E.length>12))break}const i=d.match(/\\"elastic_title\\"\s*:\s*\\"([^"\\]{3,80})\\"/);i&&E.push({src:"escaped_elastic_title",text:i[1]});const o=d.match(/<span class="[^"]*SpanAnchorTitle[^"]*">([^<]{3,100})<\/span>/);if(o){const n=o[1].trim();/capcut|edit like|editing made|template|effect|tiktok shop/i.test(n)||E.push({src:"SpanAnchorTitle",text:n})}const _=d.match(/<meta\s+(?:property|name)="og:title"\s+content="([^"]{3,200})"/i);_&&E.push({src:"og:title",text:_[1]});let k="";for(const n of E)if(n.text.length<=60&&!n.text.includes("tiktok.com")){k=n.text;break}const g=m?m.split(/[|·]/)[0].trim().slice(0,200):"";return{product:{id:O,title:k||g||"TikTok Shop Product",price:"",imageUrl:"",shopName:"TikTok Shop",url:F},debug:{matchedVia:"reflow_pdp_regex",slug:R,productId:O,shortTitleSource:k?(L=E.find(n=>n.text===k))==null?void 0:L.src:null,shortTitle:k||null,...S}}}return{product:null,debug:{error:"no_itemStruct",scopeKeys:Object.keys((y==null?void 0:y.__DEFAULT_SCOPE__)||{}),...S}}}const I={isECVideo:h.isECVideo,AnchorTypes:h.AnchorTypes,hasCommerceProductInfo:!!h.commerceProductInfo,anchorsLen:Array.isArray(h.anchors)?h.anchors.length:0,anchorTypes:Array.isArray(h.anchors)?h.anchors.map(C=>C==null?void 0:C.type):[],productLikeKeys:Object.keys(h).filter(C=>/ec|commerce|product|anchor|shop|tcm/i.test(C)),...S};return{product:xt(h,I),debug:I}}function xt(t,e){var m,S,A,y,h,I;const s=f=>{if(typeof f!="string")return"";const p=f.trim();return p.length<3||p.length>80||/capcut|edit like|editing made|template|effect/i.test(p)?"":p};let r="";const a=[];if(Array.isArray(t.anchors))for(const f of t.anchors){if(!f||f.type!==33&&f.type!==106)continue;a.push(["anchor.keyword",f.keyword]),a.push(["anchor.description",f.description]);let p=f.extra||f.extra_info||f.extraInfo;if(typeof p=="string")try{p=JSON.parse(p)}catch{p={}}const w=Array.isArray(p)?p:p&&typeof p=="object"?[p]:[];for(const T of w)!T||typeof T!="object"||(a.push(["extra.keyword",T.keyword]),a.push(["extra.elastic_title",T.elastic_title]),a.push(["extra.short_title",T.short_title]),a.push(["extra.display_title",T.display_title]),Array.isArray(T.marketing_words)&&T.marketing_words.length&&a.push(["extra.marketing_words[0]",T.marketing_words[0]]))}for(const[f,p]of a){const w=s(p);if(w){r=w,e.marketingTitleFrom=f;break}}const c=t.commerceProductInfo||t.commerce_product_info;if(c){const f=c.products||c.product_list||(c.title?[c]:[]),p=Array.isArray(f)?f[0]:null;if(p){e.matchedVia="commerceProductInfo";const w=String(p.title||p.product_name||p.name||"TikTok Shop Product");return{id:String(p.product_id||p.id||""),title:r||w,price:String(p.price_str||p.format_price||p.price||""),imageUrl:String(((S=(m=p.cover)==null?void 0:m.urlList)==null?void 0:S[0])||p.cover_url||p.image||""),shopName:String(p.shop_name||p.seller_name||""),url:String(p.product_link||p.detail_url||"")}}}const l=t.anchors||[];if(Array.isArray(l))for(const f of l){if(!f||f.type===35||f.id===35||f.type!==33&&f.id!==33&&f.type!==106)continue;let p=f.extra||f.extra_info||f.extraInfo;if(typeof p=="string")try{p=JSON.parse(p)}catch{p={}}const w=Array.isArray(p)?p[0]||{}:p||{};let T={};try{T=typeof f.logExtra=="string"?JSON.parse(f.logExtra):f.logExtra||{}}catch{}const D=r||f.keyword||f.description||f.name||w.product_name||w.elastic_title||w.keyword||T.product_name;if(D)return e.matchedVia=`anchor_type_${f.type}`,{id:String(w.product_id||w.id||T.product_id||f.id||""),title:String(D),price:String(w.price||w.format_price||w.price_str||""),imageUrl:String(((y=(A=f.thumbnail)==null?void 0:A.urlList)==null?void 0:y[0])||((I=(h=f.icon)==null?void 0:h.urlList)==null?void 0:I[0])||w.cover_url||w.image||""),shopName:String(w.shop_name||T.shop_name||""),url:String(f.schema||f.actionUrl||w.product_link||"")}}const u=JSON.stringify(t),d=u.match(/"product_name"\s*:\s*"([^"]{3,200})"/)||u.match(/"title"\s*:\s*"([^"]{3,200})"[^}]*"price/);if(d){e.matchedVia="regex_scan";const f=u.match(/"product_id"\s*:\s*"?(\d{6,})"?/),p=u.match(/"format_price"\s*:\s*"([^"]+)"/)||u.match(/"price_str"\s*:\s*"([^"]+)"/),w=u.match(/"cover_url"\s*:\s*"([^"]+)"/);return{id:(f==null?void 0:f[1])||"",title:d[1],price:(p==null?void 0:p[1])||"",imageUrl:(w==null?void 0:w[1])||""}}return null}const ft=new Map,Dt=5*60*1e3;async function _t(t){if(!t)return t;const e=!!t.url&&/tiktok\.com\/shop\/[a-z]{2}\/pdp\//i.test(t.url);if(e&&t.price)return t;let s="";if(e?s=t.url:t.id&&/^\d{6,}$/.test(String(t.id))&&(s=`https://www.tiktok.com/shop/vn/pdp/${(t.title||"product").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"").slice(0,80)||"product"}/${t.id}`),s)try{const c=await ct(s);if(c.title||c.price||c.imageUrl){const l=(t.title||"").trim(),d=l.length>0&&l.length<=80&&!/\s\|\s/.test(l)?l:c.title||l;return{...t,title:d,price:c.price||t.price,imageUrl:c.imageUrl||t.imageUrl,url:s,...c.originalPrice?{originalPrice:c.originalPrice}:{},...c.soldCount?{soldCount:c.soldCount}:{},...c.rating?{rating:c.rating}:{},...c.reviewCount?{reviewCount:c.reviewCount}:{}}}}catch{}if(!t.title)return t;const r=t.title.slice(0,80).toLowerCase().trim(),a=ft.get(r);if(a&&Date.now()-a.ts<Dt)return{...t,...a.product};try{await nt();const l=`https://www.tiktok.com/search/product?q=${encodeURIComponent(t.title.slice(0,80))}`,u=await fetch(l,{method:"GET",credentials:"include",redirect:"follow",headers:{Accept:"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"vi-VN,vi;q=0.9,en;q=0.8"}});if(!u.ok)throw new Error(`Shop search ${u.status}`);const m=(await u.text()).match(/tiktok\.com\/shop\/[a-z]{2}\/pdp\/([^/"'\s\\)]+)\/(\d{6,})/i);if(!m)return t;const S=m[1],A=m[2],y=`https://www.tiktok.com/shop/vn/pdp/${S}/${A}`,h=await ct(y);if(!h.title&&!h.price&&!h.imageUrl)return t;const I=(t.title||"").trim(),p=I.length>0&&I.length<=80&&!/\s\|\s/.test(I)?I:h.title||I,w={...t,id:A,title:p,price:h.price||t.price,imageUrl:h.imageUrl||t.imageUrl,url:y,...h.originalPrice?{originalPrice:h.originalPrice}:{},...h.soldCount?{soldCount:h.soldCount}:{},...h.rating?{rating:h.rating}:{},...h.reviewCount?{reviewCount:h.reviewCount}:{}};return ft.set(r,{product:w,ts:Date.now()}),w}catch{return t}}const tt=new Map,$t=15*1e3,et=new Map,Mt=10*60*1e3;function Ot(t){const e=t.match(/\/video\/(\d+)/);return e?e[1]:t}async function Lt(t,e=!1){const s=Ot(t),r=et.get(s);if(r&&Date.now()-r.ts<Mt)return{success:!0,data:r.product,debug:{method:"success_cache",cachedAge:Date.now()-r.ts}};const a=tt.get(t);if(a&&Date.now()-a<$t)return{success:!0,data:null,debug:{method:"mobile_fetch",skipReason:"recently_failed"}};let c=null,l=null;for(const u of["omit","include"])try{const d=await It(t,u);if(l={...l||{},[`mobile_${u}`]:d.debug},d.product){c=d.product;const m=await _t(c);return et.set(s,{product:m,ts:Date.now()}),{success:!0,data:m,debug:{...l,method:`mobile_fetch_${u}`,enriched:m!==c}}}}catch(d){l={...l||{},[`mobile_${u}_error`]:d.message}}if(!e)return tt.set(t,Date.now()),{success:!0,data:null,debug:{method:"mobile_fetch_no_data",skipReason:"weak_signal_no_popup",mobileDebug:l}};try{let u=rt.get(t);u||(u=qt(t),rt.set(t,u),u.finally(()=>rt.delete(t)));const d=await u;if(d){const m=await _t(d);return et.set(s,{product:m,ts:Date.now()}),{success:!0,data:m,debug:{...l,method:"hidden_window",enriched:m!==d}}}}catch(u){l={...l||{},hiddenError:u.message}}return tt.set(t,Date.now()),{success:!0,data:null,debug:{method:"hidden_window_failed",skipReason:"no_commerce_signal",mobileDebug:l}}}const it=9002,Rt=5e3,Vt=3e3,rt=new Map;async function qt(t){var m,S,A;const e=t.match(/\/video\/(\d+)/);if(!e)throw new Error("no_video_id");const s=t.match(/@([^/?#]+)/),r=s?s[1]:"_",a=new URLSearchParams;try{const y=new URL(t),h=y.searchParams.get("shop_id");h&&a.set("shop_id",h);const I=y.searchParams.get("shop_region");I&&a.set("shop_region",I)}catch{}const c=`https://www.tiktok.com/@${r}/video/${e[1]}${a.toString()?"?"+a.toString():""}`;let l;try{l=await chrome.windows.create({url:"about:blank",focused:!1,type:"popup",state:"minimized"})}catch{l=await chrome.windows.create({url:"about:blank",focused:!1,type:"popup",width:100,height:100,top:0,left:0})}const u=(S=(m=l.tabs)==null?void 0:m[0])==null?void 0:S.id,d=l.id;if(!u||!d)throw new Error("no_tab_id");try{try{await chrome.windows.update(d,{state:"minimized"})}catch{}await chrome.declarativeNetRequest.updateSessionRules({removeRuleIds:[it],addRules:[{id:it,priority:2,action:{type:"modifyHeaders",requestHeaders:[{header:"User-Agent",operation:"set",value:gt}]},condition:{urlFilter:"||tiktok.com/",resourceTypes:["main_frame","sub_frame","xmlhttprequest","script","image","media","other"],tabIds:[u]}}]}),await chrome.tabs.update(u,{url:c}),await jt(u,Rt);const y=await chrome.scripting.executeScript({target:{tabId:u},world:"MAIN",func:Ft,args:[Vt]}),h=(A=y==null?void 0:y[0])==null?void 0:A.result;return h&&h.product?h.product:null}finally{try{await chrome.declarativeNetRequest.updateSessionRules({removeRuleIds:[it]})}catch{}if(d)try{await chrome.windows.remove(d)}catch{}}}function jt(t,e){return new Promise((s,r)=>{const a=setTimeout(()=>{chrome.tabs.onUpdated.removeListener(c),r(new Error("tab_load_timeout"))},e),c=(l,u)=>{l===t&&u.status==="complete"&&(clearTimeout(a),chrome.tabs.onUpdated.removeListener(c),s())};chrome.tabs.onUpdated.addListener(c)})}async function Ft(t=4e3){const e=l=>new Promise(u=>setTimeout(u,l)),s=Date.now()+t;let r=0,a=null;for(;Date.now()<s;){r++;const l=c();if(a=l.debug,l.product)return l.debug={...l.debug,polls:r},l;await e(250)}return{product:null,via:null,debug:{...a,polls:r,exhausted:!0}};function c(){var S,A,y,h,I,f,p,w,T,D,L,C,R,O,F,E,V,G;const l={url:location.href,title:document.title};if(/security check|verify/i.test(document.title))return{product:null,via:"captcha",debug:l};let u=null;const d=['a[href*="/shop/"][href*="/pdp/"]','a[href*="tiktok.com/shop"][href*="pdp"]','[class*="DivProductAnchor"]','[class*="EcomNameMobile"]','[class*="DivEcomAnchorMobile"]','[class*="EcomAnchor"]','[data-e2e="product-anchor"]','[data-e2e="anchor-name"]','[data-e2e="video-product"]'];for(const $ of d){const M=document.querySelectorAll($);for(const v of M){const i=v,o=i.getBoundingClientRect();if(o.width<30&&o.height<30)continue;let _=(i.innerText||"").trim();if(!_){const U=i.cloneNode(!0);U.querySelectorAll("style,script").forEach(q=>q.remove()),_=(U.textContent||"").trim()}_=_.replace(/^\.?css-[a-z0-9-]+\{[^}]*\}\s*/i,"").trim();const k=i.tagName==="A"?i.href:((S=i.querySelector("a"))==null?void 0:S.href)||"",g=/\/shop\/[^/]+\/pdp\//.test(k);if(!g&&(!_||_==="Shop"||_==="TikTok Shop"||_.length>250))continue;let n=_;if(n.includes("|")&&(n=n.split("|").pop().trim()),n.length>200&&(n=n.slice(0,200)),!n&&g&&(n=i.getAttribute("aria-label")||((A=i.querySelector("img"))==null?void 0:A.getAttribute("alt"))||"TikTok Shop Product"),!n)continue;const P=((y=i.querySelector("img"))==null?void 0:y.getAttribute("src"))||(i.tagName==="IMG"?i.src:"")||"";let x="";const N=i.closest('[class*="anchor"], [class*="Anchor"], [class*="Ecom"], [class*="product"], [class*="Product"]')||i.parentElement;if(N){const U=N.querySelector('[class*="price"], [class*="Price"]');if(U&&(x=(U.innerText||U.textContent||"").trim().slice(0,40)),!x){const z=(N.innerText||N.textContent||"").match(/(\d[\d.,]+\s*(?:đ|VNĐ|VND|₫|\$|USD))/i);z&&(x=z[1].trim())}}const b={product:{id:"",title:n,price:x,imageUrl:P,shopName:"TikTok Shop",url:k||""},via:g?"DOM_PDP_LINK":"DOM_"+$,debug:l};if(P||x)return b;u||(u=b)}}const m=["SIGI_STATE","__SIGI_STATE__","__UNIVERSAL_DATA_FOR_REHYDRATION__"];for(const $ of m){const M=document.getElementById($);if(!(!M||!M.textContent))try{const v=JSON.parse(M.textContent),i=[(f=(I=(h=v==null?void 0:v.__DEFAULT_SCOPE__)==null?void 0:h["webapp.video-detail"])==null?void 0:I.itemInfo)==null?void 0:f.itemStruct,(w=(p=v==null?void 0:v.__DEFAULT_SCOPE__)==null?void 0:p["webapp.reflow.video.detail"])==null?void 0:w.itemStruct,(L=(D=(T=v==null?void 0:v.__DEFAULT_SCOPE__)==null?void 0:T["webapp.reflow.video.detail"])==null?void 0:D.itemInfo)==null?void 0:L.itemStruct,(C=v==null?void 0:v.itemInfo)==null?void 0:C.itemStruct];v!=null&&v.ItemModule&&i.push(...Object.values(v.ItemModule));for(const o of i){if(!o)continue;const _=o.commerceProductInfo||o.commerce_product_info;if(_){const g=_.products||_.product_list||(_.title?[_]:[]),n=Array.isArray(g)?g[0]:null;if(n)return{product:{id:String(n.product_id||n.id||""),title:String(n.title||n.product_name||n.name||"Product"),price:String(n.price_str||n.format_price||n.price||""),imageUrl:String(((O=(R=n.cover)==null?void 0:R.urlList)==null?void 0:O[0])||n.cover_url||n.image||""),shopName:String(n.shop_name||n.seller_name||""),url:String(n.product_link||n.detail_url||""),originalPrice:n.origin_price_str||n.market_price_str||n.original_price,soldCount:n.sold_count!=null?String(n.sold_count):void 0,rating:n.rating!=null?String(n.rating):void 0,reviewCount:n.review_count!=null?String(n.review_count):void 0},via:"commerceProductInfo",debug:l}}const k=o.anchors;if(Array.isArray(k))for(const g of k){if(!g||g.type===35||g.type!==33&&g.type!==106)continue;let n={};try{n=typeof g.extraInfo=="string"?JSON.parse(g.extraInfo):g.extraInfo||{}}catch{}const P=g.keyword||g.description||g.name||n.product_name;if(P&&!/capcut|edit like|editing made|template|effect/i.test(String(P)))return{product:{id:String(n.product_id||g.id||""),title:String(P),price:String(n.price_str||n.format_price||n.price||""),imageUrl:String(((E=(F=g.thumbnail)==null?void 0:F.urlList)==null?void 0:E[0])||((G=(V=g.icon)==null?void 0:V.urlList)==null?void 0:G[0])||n.cover_url||""),shopName:String(n.shop_name||""),url:String(g.schema||g.actionUrl||n.product_link||""),originalPrice:n.origin_price_str||n.market_price_str,soldCount:n.sold_count!=null?String(n.sold_count):void 0,rating:n.rating!=null?String(n.rating):void 0,reviewCount:n.review_count!=null?String(n.review_count):void 0},via:"anchor_type_"+g.type,debug:l}}}}catch{}}return u||{product:null,debug:l}}}function Gt(t){return t.replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g,"").replace(/\s+/g," ").trim().slice(0,180)}chrome.runtime.onInstalled.addListener(t=>{t.reason});
+const ot=(...t)=>{};chrome.runtime.onMessage.addListener((t,e,s)=>{switch(t.type){case"TIKTOK_DOWNLOAD":return __serverDownload(t.url,t.filename).then(s),!0;case"GET_TIKTOK_METADATA":return __serverMetadata(t.url,t.priority,t.refresh===!0,t.playback===!0).then(s),!0;case"__DOWNLOAD_MULTI_FETCH_BYTES__":return __fetchBytesForChosenFolder(t.url).then(s),!0;case"GET_DOWNLOADDUCT":return Lt(t.url,t.strongSignal===!0).then(s),!0;case"OPEN_PRODUCT_TAB":{const r=String(t.url||"");return/^https:\/\/(www\.)?tiktok\.com\//i.test(r)||/^https:\/\/vm\.tiktok\.com\//i.test(r)?(chrome.tabs.create({url:r,active:!0}).catch(c=>ot("[BG] open tab fail:",c)),!1):(ot("[BG] OPEN_PRODUCT_TAB rejected non-TikTok URL:",r.slice(0,80)),!1)}case"GET_TIKTOK_PDP_INFO":return At(t.url).then(s),!0;case"GET_PROFILE_SHOP_VIDEOS":return __serverProfileShop(t.username).then(s),!0;default:return!1}});async function __getAskWhereToSave(){try{const r=await chrome.storage.local.get("askWhereToSave");return r&&r.askWhereToSave===!0}catch{return!1}}function wt(t,e,s){const r=(t||"tiktok").trim(),a=(e||"").trim(),c=a?r+" - "+a:r+" - "+s;return Gt(c)+".mp4"}const lt=new Map,J=new Map,bt=5*60*1e3;async function At(t){if(!t||!/\/shop\/[^/]+\/pdp\//.test(t))return{success:!1,error:"not_a_pdp_url"};const e=(t.match(/^https?:\/\/[^/]+\/shop\/[^/]+\/pdp\/[^/]+\/\d+/)||[t])[0];try{const s=lt.get(e);if(s&&Date.now()-s.ts<bt)return{success:!0,data:s.info};const r=J.get(e);if(r)return{success:!0,data:await r};const a=ct(e).then(l=>(lt.set(e,{info:l,ts:Date.now()}),J.delete(e),l)).catch(l=>{throw J.delete(e),l});return J.set(e,a),{success:!0,data:await a}}catch(s){return{success:!1,error:s.message}}}async function ct(t){var a,c;await nt();const e=await fetch(t,{method:"GET",credentials:"include",redirect:"follow",headers:{Accept:"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"vi-VN,vi;q=0.9,en;q=0.8"}});if(!e.ok)throw new Error(`PDP fetch ${e.status}`);const s=await e.text(),r=((c=(a=s.match(/<title[^>]*>([^<]+)<\/title>/))==null?void 0:a[1])==null?void 0:c.trim())||"";if(/^(security check|please verify|verify to continue|please complete|access denied)$/i.test(r)||/captcha|secsdk-captcha|verify[-_]?modal/i.test(s.slice(0,5e3)))throw new Error("pdp_captcha_or_rate_limited");return Pt(s)}function K(t,e,s=0){const r=`"${e}":`;let a=s;for(;a<t.length;){const c=t.indexOf(r,a);if(c<0)return null;const l=t.indexOf("{",c+r.length);if(l<0)return null;let u=0,d=!1,m=!1;const S=Math.min(t.length,l+2e5);for(let A=l;A<S;A++){const y=t[A];if(m){m=!1;continue}if(y==="\\"&&d){m=!0;continue}if(y==='"'){d=!d;continue}if(!d){if(y==="{")u++;else if(y==="}"&&(u--,u===0))try{return{obj:JSON.parse(t.slice(l,A+1)),endIdx:A+1}}catch{break}}}a=l+1}return null}function Pt(t){var I,f,p,w,T,D,L,C,R,O,F,E,V,G,$,M,v;const e={},s=K(t,"product_model"),r=s==null?void 0:s.obj,a=(s==null?void 0:s.endIdx)??0,c=K(t,"price_info",a),l=K(t,"rating_info",a),u=K(t,"default_sku",a),d=K(t,"sku_list",a);if(r&&typeof r=="object"){if(!e.title){const i=r.name||r.title||r.product_name||r.product_title||r.display_name;i&&(e.title=String(i).slice(0,200))}if(!e.soldCount&&r.sold_count!==void 0&&r.sold_count!==0&&r.sold_count!=="0"&&(e.soldCount=String(r.sold_count)),!e.imageUrl){const i=((p=(f=(I=r.main_images)==null?void 0:I[0])==null?void 0:f.url_list)==null?void 0:p[0])||((D=(T=(w=r.images)==null?void 0:w[0])==null?void 0:T.url_list)==null?void 0:D[0])||r.cover_url||((C=(L=r.cover)==null?void 0:L.url_list)==null?void 0:C[0]);i&&(e.imageUrl=String(i))}}if(!e.title){const i=K(t,"product_info"),o=i==null?void 0:i.obj;if(o&&typeof o=="object"){const _=o.title||o.name||o.product_name||o.product_title;_&&(e.title=String(_).slice(0,200))}}if(!e.title){const i=t.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i)||t.match(/<meta\s+content=["']([^"']+)["']\s+property=["']og:title["']/i);if(i!=null&&i[1]){let o=i[1].trim();o=o.replace(/\s*[\|·\-–—]\s*(TikTok Shop|TikTok)\s*$/i,"").trim(),o&&o.length>3&&(e.title=o.slice(0,200))}}if(!e.title){const i=t.match(/<title[^>]*>([^<]+)<\/title>/);if(i!=null&&i[1]){let o=i[1].trim();o=o.replace(/\s*[\|·\-–—]\s*(TikTok Shop|TikTok)\s*$/i,"").trim(),o&&o.length>3&&!/^(TikTok|TikTok Shop|Login|Verify)$/i.test(o)&&(e.title=o.slice(0,200))}}if(!e.title){const i=/"(?:product_name|product_title|elastic_title)"\s*:\s*"([^"\\]{4,200})"/,o=t.match(i);o!=null&&o[1]&&(e.title=o[1].slice(0,200))}const m=[c==null?void 0:c.obj,r==null?void 0:r.price_info,r==null?void 0:r.priceInfo,u==null?void 0:u.obj,r==null?void 0:r.default_sku].filter(Boolean);for(const i of m){if(e.price)break;if(e.price=i.format_price||i.price_str||i.price||i.sale_price_str||i.sale_price||i.current_price_str||i.current_price||i.real_price_str||i.real_price,!e.originalPrice){const o=i.market_price_str||i.market_price||i.origin_price_str||i.origin_price||i.list_price_str||i.list_price;o&&o!==e.price&&o!==0&&o!=="0"&&(e.originalPrice=String(o))}}if(!e.price&&(d!=null&&d.obj)){const i=Array.isArray(d.obj)?d.obj:Array.isArray(d.obj.skus)?d.obj.skus:Array.isArray(d.obj.list)?d.obj.list:[];for(const o of i){if(!o||typeof o!="object")continue;const _=o.format_price||o.price_str||o.price||o.sale_price_str||o.sale_price||((R=o.price_info)==null?void 0:R.format_price)||((O=o.price_info)==null?void 0:O.price);if(_&&_!==0&&_!=="0"){e.price=String(_);break}}}if(!e.price&&r&&Array.isArray(r.skus))for(const i of r.skus){if(!i||typeof i!="object")continue;const o=i.format_price||i.price_str||i.price||i.sale_price_str||i.sale_price||((F=i.price_info)==null?void 0:F.format_price)||((E=i.price_info)==null?void 0:E.price);if(o&&o!==0&&o!=="0"){e.price=String(o);break}}if(e.price&&/^\d+$/.test(String(e.price))){const i=Number(e.price);Number.isFinite(i)&&i>=1e3&&(e.price=`đ${i.toLocaleString("vi-VN")}`)}if(e.originalPrice&&/^\d+$/.test(String(e.originalPrice))){const i=Number(e.originalPrice);Number.isFinite(i)&&i>=1e3&&(e.originalPrice=`đ${i.toLocaleString("vi-VN")}`)}if(e.price&&/^[đ₫]?0+$/.test(String(e.price).replace(/[.,\s]/g,""))&&(e.price=void 0),!e.price){const i=(V=t.match(/"sale_price_format"\s*:\s*"([^"]+)"/))==null?void 0:V[1],o=(G=t.match(/"origin_price_format"\s*:\s*"([^"]+)"/))==null?void 0:G[1],_=(($=t.match(/"price_prefix"\s*:\s*"([^"]+)"/))==null?void 0:$[1])||"",k=/["']?(VND|VNĐ)["']?/i.test(t.slice(0,2e5)),g=!_||/^(t[ưừ]|from)$/i.test(_.trim())?k?"₫":"đ":_;i&&i!=="0"&&(e.price=`${g}${i}`),!e.originalPrice&&o&&o!==i&&o!=="0"&&(e.originalPrice=`${g}${o}`)}if(!e.price){const i=(M=t.match(/"sale_price_decimal"\s*:\s*"?(\d+)"?/))==null?void 0:M[1],o=(v=t.match(/"origin_price_decimal"\s*:\s*"?(\d+)"?/))==null?void 0:v[1];if(i&&i!=="0"){const _=Number(i);Number.isFinite(_)&&_>=1e3&&(e.price=`đ${_.toLocaleString("vi-VN")}`)}if(!e.originalPrice&&o&&o!=="0"&&o!==i){const _=Number(o);Number.isFinite(_)&&_>=1e3&&(e.originalPrice=`đ${_.toLocaleString("vi-VN")}`)}}if(!e.price){const i=[],o=/(?:đ|₫|\\u0111|\\u20ab)([\d.]+)/gi;let _;for(;(_=o.exec(t))!==null;){const k=Number(_[1].replace(/\./g,""));if(Number.isFinite(k)&&k>=1e3&&k<=1e9&&i.push(k),i.length>200)break}if(i.length){const k=new Map;for(const P of i)k.set(P,(k.get(P)??0)+1);const n=[...k.entries()].sort((P,x)=>x[1]-P[1]).slice(0,2).map(P=>P[0]).sort((P,x)=>P-x);n[0]&&(e.price=`đ${n[0].toLocaleString("vi-VN")}`,n[1]&&n[1]>n[0]&&(e.originalPrice=`đ${n[1].toLocaleString("vi-VN")}`))}}if(!e.rating){const i=t.match(/"product_overall_score"\s*:\s*"?([\d.]+)"?/)||t.match(/"product_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"average_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"avg_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"avg_rate"\s*:\s*"?([\d.]+)"?/)||t.match(/"product_rate"\s*:\s*"?([\d.]+)"?/)||t.match(/"rating_value"\s*:\s*"?([\d.]+)"?/)||t.match(/"score"\s*:\s*([\d.]+)/)||t.match(/"rating"\s*:\s*([\d.]+)/);i!=null&&i[1]&&i[1]!=="0"&&i[1]!=="0.0"&&(e.rating=i[1])}if(!e.reviewCount){const i=t.match(/"product_review_count"\s*:\s*"?(\d+)"?/)||t.match(/"review_count"\s*:\s*"?(\d+)"?/)||t.match(/"rating_count"\s*:\s*"?(\d+)"?/)||t.match(/"total_reviews"\s*:\s*"?(\d+)"?/)||t.match(/"comments_count"\s*:\s*"?(\d+)"?/);i!=null&&i[1]&&i[1]!=="0"&&(e.reviewCount=i[1])}const S=[l==null?void 0:l.obj,r==null?void 0:r.rating_info,r==null?void 0:r.ratingInfo,r==null?void 0:r.product_rating_info].filter(Boolean);for(const i of S){if(e.rating&&e.reviewCount)break;if(!e.rating){const o=i.rating||i.product_rating||i.average_rating||i.rating_value;o!==void 0&&o!==0&&o!=="0"&&o!=="0.0"&&(e.rating=String(o))}if(!e.reviewCount){const o=i.review_count||i.rating_count||i.product_rating_count;o!==void 0&&o!==0&&o!=="0"&&(e.reviewCount=String(o))}}!e.rating&&(r!=null&&r.product_rating)&&(e.rating=String(r.product_rating)),!e.reviewCount&&(r!=null&&r.review_count)&&(e.reviewCount=String(r.review_count));const A=t.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/g)||[];for(const i of A){const o=i.replace(/^<script[^>]*>/,"").replace(/<\/script>$/,"").trim();try{const _=JSON.parse(o),k=Array.isArray(_)?_:[_];for(const g of k){if(!g||typeof g!="object")continue;const n=g["@type"];if(n==="Product"||n==="product"||Array.isArray(n)&&n.includes("Product")){const P=g.offers,x=Array.isArray(P)?P:P?[P]:[];for(const b of x){if(!e.price){const U=b.price||b.lowPrice,q=b.priceCurrency||b.currency;U&&(e.price=Q(U,q))}!e.originalPrice&&b.highPrice&&b.highPrice!==b.lowPrice&&(e.originalPrice=Q(b.highPrice,b.priceCurrency))}const N=g.aggregateRating;if(N&&(!e.rating&&N.ratingValue!==void 0&&(e.rating=String(N.ratingValue)),!e.reviewCount&&(N.reviewCount!==void 0||N.ratingCount!==void 0)&&(e.reviewCount=String(N.reviewCount??N.ratingCount))),!e.description&&g.description&&(e.description=String(g.description).slice(0,600)),!e.imageUrl){const b=g.image;typeof b=="string"?e.imageUrl=b:Array.isArray(b)&&typeof b[0]=="string"&&(e.imageUrl=b[0])}}}}catch{}}if(!e.price){const i=t.match(/<meta[^>]+property=["']og:price:amount["'][^>]+content=["']([^"']+)["']/i)||t.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:price:amount["']/i),o=t.match(/<meta[^>]+property=["']og:price:currency["'][^>]+content=["']([^"']+)["']/i)||t.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:price:currency["']/i);i!=null&&i[1]&&(e.price=Q(i[1],o==null?void 0:o[1]))}const y=i=>i.replace(/\\u0111/gi,"đ").replace(/\\u20ab/gi,"₫").replace(/\\u20AB/gi,"₫");if(!e.price){const i=t.match(/"price_str"\s*:\s*"([^"]+)"/)||t.match(/"format_price"\s*:\s*"([^"]+)"/)||t.match(/"sale_price_str"\s*:\s*"([^"]+)"/)||t.match(/"discount_price_str"\s*:\s*"([^"]+)"/)||t.match(/"current_price_str"\s*:\s*"([^"]+)"/);if(i!=null&&i[1]){const o=y(i[1]);o.replace(/[^\d]/g,"").replace(/^0+$/,"")&&(e.price=o)}}if(!e.price){const i=t.match(/"sale_price"\s*:\s*(\d{4,})/)||t.match(/"current_price"\s*:\s*(\d{4,})/)||t.match(/"real_price"\s*:\s*(\d{4,})/)||t.match(/"product_price"\s*:\s*(\d{4,})/);if(i!=null&&i[1]){const o=Number(i[1]);Number.isFinite(o)&&o>0&&(e.price=`đ${o.toLocaleString("vi-VN")}`)}}if(!e.originalPrice){const i=t.match(/"market_price_str"\s*:\s*"([^"]+)"/)||t.match(/"original_price_str"\s*:\s*"([^"]+)"/)||t.match(/"list_price_str"\s*:\s*"([^"]+)"/);if(i!=null&&i[1]){const o=y(i[1]);o.replace(/[^\d]/g,"").replace(/^0+$/,"")&&(e.originalPrice=o)}}if(!e.originalPrice){const i=t.match(/"market_price"\s*:\s*(\d{4,})/)||t.match(/"original_price"\s*:\s*(\d{4,})/);if(i!=null&&i[1]){const o=Number(i[1]);Number.isFinite(o)&&o>0&&(e.originalPrice=`đ${o.toLocaleString("vi-VN")}`)}}if(!e.soldCount){const i=t.match(/"sold_count"\s*:\s*"?(\d[\d,.kKmM]*)"?/)||t.match(/"sales_count"\s*:\s*"?(\d[\d,.kKmM]*)"?/)||t.match(/"sold"\s*:\s*"?(\d[\d,.kKmM]+)"?/);i!=null&&i[1]&&i[1]!=="0"&&(e.soldCount=i[1])}if(!e.rating){const i=t.match(/"product_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"average_rating"\s*:\s*"?([\d.]+)"?/)||t.match(/"rating_value"\s*:\s*"?([\d.]+)"?/)||t.match(/"score"\s*:\s*"?([\d.]+)"?[\s,}]/);i!=null&&i[1]&&i[1]!=="0"&&i[1]!=="0.0"&&(e.rating=i[1])}if(!e.reviewCount){const i=t.match(/"review_count"\s*:\s*"?(\d+)"?/)||t.match(/"rating_count"\s*:\s*"?(\d+)"?/)||t.match(/"product_rating_count"\s*:\s*"?(\d+)"?/);i!=null&&i[1]&&i[1]!=="0"&&(e.reviewCount=i[1])}const h=[];if(/HÀNG\s*VIỆT|HANG_VIET|HangViet/.test(t)&&h.push("HÀNG VIỆT"),h.length&&(e.tags=h),!e.price||!e.rating){const i={},o=t.indexOf('"product_info":');if(o>=0){const x=t.indexOf("{",o);if(x>=0){const N=[];let b=0,U=!1,q=!1;const z=Math.min(t.length,x+5e4);for(let j=x;j<z&&N.length<25;j++){const B=t[j];if(q){q=!1;continue}if(B==="\\"&&U){q=!0;continue}if(B==='"'){if(U=!U,U&&b===1){const H=t.indexOf('"',j+1);if(H>j&&H-j<80){const st=t.slice(j+1,H);t.charAt(H+1)===":"&&!st.includes("\\")&&(N.push(st),j=H,U=!1)}}continue}if(!U){if(B==="{")b++;else if(B==="}"&&(b--,b===0))break}}i.product_info_top_keys=N}}const _=t.match(/đ[\d.,]+/g)||[],k=t.match(/\\u0111[\d.,]+/g)||[],g=t.match(/[\d.,]+\s*₫/g)||[];i.dong_patterns=[..._.slice(0,6),...k.slice(0,6),...g.slice(0,6)];const n=t.match(/"[a-z_]*price[a-z_]*"\s*:\s*"?[^,"}\]]{1,40}/gi)||[];i.price_shaped_keys=n.filter(x=>!/:\s*"?0+"?/.test(x)).slice(0,15);const P=t.match(/"[a-z_]*(?:rate|rating|review|score|star)[a-z_]*"\s*:\s*"?[^,"}\]]{1,40}/gi)||[];i.rating_shaped_keys=P.filter(x=>!/:\s*"?0+"?/.test(x)).slice(0,15),i.found_price_info=t.indexOf('"price_info"')>=0,i.found_rating_info=t.indexOf('"rating_info"')>=0,i.found_default_sku=t.indexOf('"default_sku"')>=0,i.found_sku_list=t.indexOf('"sku_list"')>=0,i.found_sale_price_info=t.indexOf('"sale_price_info"')>=0,i.found_discount_info=t.indexOf('"discount_info"')>=0,e._debug=i}return e}function Q(t,e){if(t==null)return"";const s=typeof t=="number"?t:Number(String(t).replace(/[^\d.-]/g,""));if(!Number.isFinite(s)||s<=0)return"";const r=s.toLocaleString("vi-VN"),a=(e||"").toUpperCase()==="VND"?"đ":e||"";return a?`${a}${r}`:r}const gt="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",ut=9001;let dt=!1;async function nt(){if(!dt)try{await chrome.declarativeNetRequest.updateSessionRules({removeRuleIds:[ut],addRules:[{id:ut,priority:1,action:{type:"modifyHeaders",requestHeaders:[{header:"User-Agent",operation:"set",value:gt}]},condition:{urlFilter:"||tiktok.com/",resourceTypes:["xmlhttprequest","main_frame","sub_frame","other"],tabIds:[-1]}}]}),dt=!0}catch{}}async function It(t,e="include"){var p,w,T,D,L;await nt();const s=t.match(/\/video\/(\d+)/);if(!s)throw new Error("URL không có video ID");const r=s[1],a=t.match(/@([^/?#]+)/),l=`https://www.tiktok.com/@${a?a[1]:"_"}/video/${r}`,u=await fetch(l,{method:"GET",credentials:e,redirect:"follow",headers:{Accept:"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"vi-VN,vi;q=0.9,en;q=0.8"}});if(!u.ok)throw new Error(`Mobile fetch ${u.status}`);const d=await u.text(),m=((p=d.match(/<title[^>]*>([^<]+)<\/title>/))==null?void 0:p[1])||"";if(/^(security check|please verify|verify to continue|please complete|access denied)$/i.test(m.trim())||/captcha|secsdk-captcha|verify[-_]?modal/i.test(d.slice(0,5e3)))throw new Error("captcha_or_rate_limited");const S={htmlSize:d.length,titleTag:m.slice(0,120),hasCommerceProductInfoStr:d.includes("commerceProductInfo")||d.includes("commerce_product_info"),hasProductId:/"product_id"\s*:/.test(d),hasFormatPrice:/"format_price"\s*:/.test(d),hasAnchorType33:/"type"\s*:\s*33\b/.test(d),hasLoginWall:/login|verify|captcha|too many requests|redirect/i.test(m),htmlHead:d.slice(0,400)},A=d.match(/<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);if(!A)return{product:null,debug:{error:"no_universal_data_script",...S}};let y;try{y=JSON.parse(A[1])}catch(C){return{product:null,debug:{error:"parse_fail",msg:C.message,...S}}}const h=(D=(T=(w=y==null?void 0:y.__DEFAULT_SCOPE__)==null?void 0:w["webapp.video-detail"])==null?void 0:T.itemInfo)==null?void 0:D.itemStruct;if(!h){const C=d.match(/tiktok\.com\/shop\/[a-z]{2}\/pdp\/([^/"'\s\\)]+)\/(\d{6,})/i);if(C){const R=C[1],O=C[2],F=`https://www.tiktok.com/shop/vn/pdp/${R}/${O}`,E=[],V=d.match(/"elastic_title"\s*:\s*"([^"]{3,80})"/);V&&E.push({src:"elastic_title",text:V[1]});const G=/"keyword"\s*:\s*"([^"\\]{3,80})"/g;let $;for(;($=G.exec(d))!==null;){const n=$[1];if(!/capcut|edit like|editing made|template|effect|tiktok shop/i.test(n)&&(E.push({src:"keyword",text:n}),E.length>8))break}const M=/\\"keyword\\"\s*:\s*\\"([^"\\]{3,80})\\"/g;let v;for(;(v=M.exec(d))!==null;){const n=v[1];if(!/capcut|edit like|editing made|template|effect|tiktok shop/i.test(n)&&(E.push({src:"escaped_keyword",text:n}),E.length>12))break}const i=d.match(/\\"elastic_title\\"\s*:\s*\\"([^"\\]{3,80})\\"/);i&&E.push({src:"escaped_elastic_title",text:i[1]});const o=d.match(/<span class="[^"]*SpanAnchorTitle[^"]*">([^<]{3,100})<\/span>/);if(o){const n=o[1].trim();/capcut|edit like|editing made|template|effect|tiktok shop/i.test(n)||E.push({src:"SpanAnchorTitle",text:n})}const _=d.match(/<meta\s+(?:property|name)="og:title"\s+content="([^"]{3,200})"/i);_&&E.push({src:"og:title",text:_[1]});let k="";for(const n of E)if(n.text.length<=60&&!n.text.includes("tiktok.com")){k=n.text;break}const g=m?m.split(/[|·]/)[0].trim().slice(0,200):"";return{product:{id:O,title:k||g||"TikTok Shop Product",price:"",imageUrl:"",shopName:"TikTok Shop",url:F},debug:{matchedVia:"reflow_pdp_regex",slug:R,productId:O,shortTitleSource:k?(L=E.find(n=>n.text===k))==null?void 0:L.src:null,shortTitle:k||null,...S}}}return{product:null,debug:{error:"no_itemStruct",scopeKeys:Object.keys((y==null?void 0:y.__DEFAULT_SCOPE__)||{}),...S}}}const I={isECVideo:h.isECVideo,AnchorTypes:h.AnchorTypes,hasCommerceProductInfo:!!h.commerceProductInfo,anchorsLen:Array.isArray(h.anchors)?h.anchors.length:0,anchorTypes:Array.isArray(h.anchors)?h.anchors.map(C=>C==null?void 0:C.type):[],productLikeKeys:Object.keys(h).filter(C=>/ec|commerce|product|anchor|shop|tcm/i.test(C)),...S};return{product:xt(h,I),debug:I}}function xt(t,e){var m,S,A,y,h,I;const s=f=>{if(typeof f!="string")return"";const p=f.trim();return p.length<3||p.length>80||/capcut|edit like|editing made|template|effect/i.test(p)?"":p};let r="";const a=[];if(Array.isArray(t.anchors))for(const f of t.anchors){if(!f||f.type!==33&&f.type!==106)continue;a.push(["anchor.keyword",f.keyword]),a.push(["anchor.description",f.description]);let p=f.extra||f.extra_info||f.extraInfo;if(typeof p=="string")try{p=JSON.parse(p)}catch{p={}}const w=Array.isArray(p)?p:p&&typeof p=="object"?[p]:[];for(const T of w)!T||typeof T!="object"||(a.push(["extra.keyword",T.keyword]),a.push(["extra.elastic_title",T.elastic_title]),a.push(["extra.short_title",T.short_title]),a.push(["extra.display_title",T.display_title]),Array.isArray(T.marketing_words)&&T.marketing_words.length&&a.push(["extra.marketing_words[0]",T.marketing_words[0]]))}for(const[f,p]of a){const w=s(p);if(w){r=w,e.marketingTitleFrom=f;break}}const c=t.commerceProductInfo||t.commerce_product_info;if(c){const f=c.products||c.product_list||(c.title?[c]:[]),p=Array.isArray(f)?f[0]:null;if(p){e.matchedVia="commerceProductInfo";const w=String(p.title||p.product_name||p.name||"TikTok Shop Product");return{id:String(p.product_id||p.id||""),title:r||w,price:String(p.price_str||p.format_price||p.price||""),imageUrl:String(((S=(m=p.cover)==null?void 0:m.urlList)==null?void 0:S[0])||p.cover_url||p.image||""),shopName:String(p.shop_name||p.seller_name||""),url:String(p.product_link||p.detail_url||"")}}}const l=t.anchors||[];if(Array.isArray(l))for(const f of l){if(!f||f.type===35||f.id===35||f.type!==33&&f.id!==33&&f.type!==106)continue;let p=f.extra||f.extra_info||f.extraInfo;if(typeof p=="string")try{p=JSON.parse(p)}catch{p={}}const w=Array.isArray(p)?p[0]||{}:p||{};let T={};try{T=typeof f.logExtra=="string"?JSON.parse(f.logExtra):f.logExtra||{}}catch{}const D=r||f.keyword||f.description||f.name||w.product_name||w.elastic_title||w.keyword||T.product_name;if(D)return e.matchedVia=`anchor_type_${f.type}`,{id:String(w.product_id||w.id||T.product_id||f.id||""),title:String(D),price:String(w.price||w.format_price||w.price_str||""),imageUrl:String(((y=(A=f.thumbnail)==null?void 0:A.urlList)==null?void 0:y[0])||((I=(h=f.icon)==null?void 0:h.urlList)==null?void 0:I[0])||w.cover_url||w.image||""),shopName:String(w.shop_name||T.shop_name||""),url:String(f.schema||f.actionUrl||w.product_link||"")}}const u=JSON.stringify(t),d=u.match(/"product_name"\s*:\s*"([^"]{3,200})"/)||u.match(/"title"\s*:\s*"([^"]{3,200})"[^}]*"price/);if(d){e.matchedVia="regex_scan";const f=u.match(/"product_id"\s*:\s*"?(\d{6,})"?/),p=u.match(/"format_price"\s*:\s*"([^"]+)"/)||u.match(/"price_str"\s*:\s*"([^"]+)"/),w=u.match(/"cover_url"\s*:\s*"([^"]+)"/);return{id:(f==null?void 0:f[1])||"",title:d[1],price:(p==null?void 0:p[1])||"",imageUrl:(w==null?void 0:w[1])||""}}return null}const ft=new Map,Dt=5*60*1e3;async function _t(t){if(!t)return t;const e=!!t.url&&/tiktok\.com\/shop\/[a-z]{2}\/pdp\//i.test(t.url);if(e&&t.price)return t;let s="";if(e?s=t.url:t.id&&/^\d{6,}$/.test(String(t.id))&&(s=`https://www.tiktok.com/shop/vn/pdp/${(t.title||"product").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"").slice(0,80)||"product"}/${t.id}`),s)try{const c=await ct(s);if(c.title||c.price||c.imageUrl){const l=(t.title||"").trim(),d=l.length>0&&l.length<=80&&!/\s\|\s/.test(l)?l:c.title||l;return{...t,title:d,price:c.price||t.price,imageUrl:c.imageUrl||t.imageUrl,url:s,...c.originalPrice?{originalPrice:c.originalPrice}:{},...c.soldCount?{soldCount:c.soldCount}:{},...c.rating?{rating:c.rating}:{},...c.reviewCount?{reviewCount:c.reviewCount}:{}}}}catch{}if(!t.title)return t;const r=t.title.slice(0,80).toLowerCase().trim(),a=ft.get(r);if(a&&Date.now()-a.ts<Dt)return{...t,...a.product};try{await nt();const l=`https://www.tiktok.com/search/product?q=${encodeURIComponent(t.title.slice(0,80))}`,u=await fetch(l,{method:"GET",credentials:"include",redirect:"follow",headers:{Accept:"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"vi-VN,vi;q=0.9,en;q=0.8"}});if(!u.ok)throw new Error(`Shop search ${u.status}`);const m=(await u.text()).match(/tiktok\.com\/shop\/[a-z]{2}\/pdp\/([^/"'\s\\)]+)\/(\d{6,})/i);if(!m)return t;const S=m[1],A=m[2],y=`https://www.tiktok.com/shop/vn/pdp/${S}/${A}`,h=await ct(y);if(!h.title&&!h.price&&!h.imageUrl)return t;const I=(t.title||"").trim(),p=I.length>0&&I.length<=80&&!/\s\|\s/.test(I)?I:h.title||I,w={...t,id:A,title:p,price:h.price||t.price,imageUrl:h.imageUrl||t.imageUrl,url:y,...h.originalPrice?{originalPrice:h.originalPrice}:{},...h.soldCount?{soldCount:h.soldCount}:{},...h.rating?{rating:h.rating}:{},...h.reviewCount?{reviewCount:h.reviewCount}:{}};return ft.set(r,{product:w,ts:Date.now()}),w}catch{return t}}const tt=new Map,$t=15*1e3,et=new Map,Mt=10*60*1e3;function Ot(t){const e=t.match(/\/video\/(\d+)/);return e?e[1]:t}async function Lt(t,e=!1){const s=Ot(t),r=et.get(s);if(r&&Date.now()-r.ts<Mt)return{success:!0,data:r.product,debug:{method:"success_cache",cachedAge:Date.now()-r.ts}};const a=tt.get(t);if(a&&Date.now()-a<$t)return{success:!0,data:null,debug:{method:"mobile_fetch",skipReason:"recently_failed"}};let c=null,l=null;for(const u of["omit","include"])try{const d=await It(t,u);if(l={...l||{},[`mobile_${u}`]:d.debug},d.product){c=d.product;const m=await _t(c);return et.set(s,{product:m,ts:Date.now()}),{success:!0,data:m,debug:{...l,method:`mobile_fetch_${u}`,enriched:m!==c}}}}catch(d){l={...l||{},[`mobile_${u}_error`]:d.message}}if(!e)return tt.set(t,Date.now()),{success:!0,data:null,debug:{method:"mobile_fetch_no_data",skipReason:"weak_signal_no_popup",mobileDebug:l}};try{let u=rt.get(t);u||(u=qt(t),rt.set(t,u),u.finally(()=>rt.delete(t)));const d=await u;if(d){const m=await _t(d);return et.set(s,{product:m,ts:Date.now()}),{success:!0,data:m,debug:{...l,method:"hidden_window",enriched:m!==d}}}}catch(u){l={...l||{},hiddenError:u.message}}return tt.set(t,Date.now()),{success:!0,data:null,debug:{method:"hidden_window_failed",skipReason:"no_commerce_signal",mobileDebug:l}}}const it=9002,Rt=5e3,Vt=3e3,rt=new Map;async function qt(t){var m,S,A;const e=t.match(/\/video\/(\d+)/);if(!e)throw new Error("no_video_id");const s=t.match(/@([^/?#]+)/),r=s?s[1]:"_",a=new URLSearchParams;try{const y=new URL(t),h=y.searchParams.get("shop_id");h&&a.set("shop_id",h);const I=y.searchParams.get("shop_region");I&&a.set("shop_region",I)}catch{}const c=`https://www.tiktok.com/@${r}/video/${e[1]}${a.toString()?"?"+a.toString():""}`;let l;try{l=await chrome.windows.create({url:"about:blank",focused:!1,type:"popup",state:"minimized"})}catch{l=await chrome.windows.create({url:"about:blank",focused:!1,type:"popup",width:100,height:100,top:0,left:0})}const u=(S=(m=l.tabs)==null?void 0:m[0])==null?void 0:S.id,d=l.id;if(!u||!d)throw new Error("no_tab_id");try{try{await chrome.windows.update(d,{state:"minimized"})}catch{}await chrome.declarativeNetRequest.updateSessionRules({removeRuleIds:[it],addRules:[{id:it,priority:2,action:{type:"modifyHeaders",requestHeaders:[{header:"User-Agent",operation:"set",value:gt}]},condition:{urlFilter:"||tiktok.com/",resourceTypes:["main_frame","sub_frame","xmlhttprequest","script","image","media","other"],tabIds:[u]}}]}),await chrome.tabs.update(u,{url:c}),await jt(u,Rt);const y=await chrome.scripting.executeScript({target:{tabId:u},world:"MAIN",func:Ft,args:[Vt]}),h=(A=y==null?void 0:y[0])==null?void 0:A.result;return h&&h.product?h.product:null}finally{try{await chrome.declarativeNetRequest.updateSessionRules({removeRuleIds:[it]})}catch{}if(d)try{await chrome.windows.remove(d)}catch{}}}function jt(t,e){return new Promise((s,r)=>{const a=setTimeout(()=>{chrome.tabs.onUpdated.removeListener(c),r(new Error("tab_load_timeout"))},e),c=(l,u)=>{l===t&&u.status==="complete"&&(clearTimeout(a),chrome.tabs.onUpdated.removeListener(c),s())};chrome.tabs.onUpdated.addListener(c)})}async function Ft(t=4e3){const e=l=>new Promise(u=>setTimeout(u,l)),s=Date.now()+t;let r=0,a=null;for(;Date.now()<s;){r++;const l=c();if(a=l.debug,l.product)return l.debug={...l.debug,polls:r},l;await e(250)}return{product:null,via:null,debug:{...a,polls:r,exhausted:!0}};function c(){var S,A,y,h,I,f,p,w,T,D,L,C,R,O,F,E,V,G;const l={url:location.href,title:document.title};if(/security check|verify/i.test(document.title))return{product:null,via:"captcha",debug:l};let u=null;const d=['a[href*="/shop/"][href*="/pdp/"]','a[href*="tiktok.com/shop"][href*="pdp"]','[class*="DivProductAnchor"]','[class*="EcomNameMobile"]','[class*="DivEcomAnchorMobile"]','[class*="EcomAnchor"]','[data-e2e="product-anchor"]','[data-e2e="anchor-name"]','[data-e2e="video-product"]'];for(const $ of d){const M=document.querySelectorAll($);for(const v of M){const i=v,o=i.getBoundingClientRect();if(o.width<30&&o.height<30)continue;let _=(i.innerText||"").trim();if(!_){const U=i.cloneNode(!0);U.querySelectorAll("style,script").forEach(q=>q.remove()),_=(U.textContent||"").trim()}_=_.replace(/^\.?css-[a-z0-9-]+\{[^}]*\}\s*/i,"").trim();const k=i.tagName==="A"?i.href:((S=i.querySelector("a"))==null?void 0:S.href)||"",g=/\/shop\/[^/]+\/pdp\//.test(k);if(!g&&(!_||_==="Shop"||_==="TikTok Shop"||_.length>250))continue;let n=_;if(n.includes("|")&&(n=n.split("|").pop().trim()),n.length>200&&(n=n.slice(0,200)),!n&&g&&(n=i.getAttribute("aria-label")||((A=i.querySelector("img"))==null?void 0:A.getAttribute("alt"))||"TikTok Shop Product"),!n)continue;const P=((y=i.querySelector("img"))==null?void 0:y.getAttribute("src"))||(i.tagName==="IMG"?i.src:"")||"";let x="";const N=i.closest('[class*="anchor"], [class*="Anchor"], [class*="Ecom"], [class*="product"], [class*="Product"]')||i.parentElement;if(N){const U=N.querySelector('[class*="price"], [class*="Price"]');if(U&&(x=(U.innerText||U.textContent||"").trim().slice(0,40)),!x){const z=(N.innerText||N.textContent||"").match(/(\d[\d.,]+\s*(?:đ|VNĐ|VND|₫|\$|USD))/i);z&&(x=z[1].trim())}}const b={product:{id:"",title:n,price:x,imageUrl:P,shopName:"TikTok Shop",url:k||""},via:g?"DOM_PDP_LINK":"DOM_"+$,debug:l};if(P||x)return b;u||(u=b)}}const m=["SIGI_STATE","__SIGI_STATE__","__UNIVERSAL_DATA_FOR_REHYDRATION__"];for(const $ of m){const M=document.getElementById($);if(!(!M||!M.textContent))try{const v=JSON.parse(M.textContent),i=[(f=(I=(h=v==null?void 0:v.__DEFAULT_SCOPE__)==null?void 0:h["webapp.video-detail"])==null?void 0:I.itemInfo)==null?void 0:f.itemStruct,(w=(p=v==null?void 0:v.__DEFAULT_SCOPE__)==null?void 0:p["webapp.reflow.video.detail"])==null?void 0:w.itemStruct,(L=(D=(T=v==null?void 0:v.__DEFAULT_SCOPE__)==null?void 0:T["webapp.reflow.video.detail"])==null?void 0:D.itemInfo)==null?void 0:L.itemStruct,(C=v==null?void 0:v.itemInfo)==null?void 0:C.itemStruct];v!=null&&v.ItemModule&&i.push(...Object.values(v.ItemModule));for(const o of i){if(!o)continue;const _=o.commerceProductInfo||o.commerce_product_info;if(_){const g=_.products||_.product_list||(_.title?[_]:[]),n=Array.isArray(g)?g[0]:null;if(n)return{product:{id:String(n.product_id||n.id||""),title:String(n.title||n.product_name||n.name||"Product"),price:String(n.price_str||n.format_price||n.price||""),imageUrl:String(((O=(R=n.cover)==null?void 0:R.urlList)==null?void 0:O[0])||n.cover_url||n.image||""),shopName:String(n.shop_name||n.seller_name||""),url:String(n.product_link||n.detail_url||""),originalPrice:n.origin_price_str||n.market_price_str||n.original_price,soldCount:n.sold_count!=null?String(n.sold_count):void 0,rating:n.rating!=null?String(n.rating):void 0,reviewCount:n.review_count!=null?String(n.review_count):void 0},via:"commerceProductInfo",debug:l}}const k=o.anchors;if(Array.isArray(k))for(const g of k){if(!g||g.type===35||g.type!==33&&g.type!==106)continue;let n={};try{n=typeof g.extraInfo=="string"?JSON.parse(g.extraInfo):g.extraInfo||{}}catch{}const P=g.keyword||g.description||g.name||n.product_name;if(P&&!/capcut|edit like|editing made|template|effect/i.test(String(P)))return{product:{id:String(n.product_id||g.id||""),title:String(P),price:String(n.price_str||n.format_price||n.price||""),imageUrl:String(((E=(F=g.thumbnail)==null?void 0:F.urlList)==null?void 0:E[0])||((G=(V=g.icon)==null?void 0:V.urlList)==null?void 0:G[0])||n.cover_url||""),shopName:String(n.shop_name||""),url:String(g.schema||g.actionUrl||n.product_link||""),originalPrice:n.origin_price_str||n.market_price_str,soldCount:n.sold_count!=null?String(n.sold_count):void 0,rating:n.rating!=null?String(n.rating):void 0,reviewCount:n.review_count!=null?String(n.review_count):void 0},via:"anchor_type_"+g.type,debug:l}}}}catch{}}return u||{product:null,debug:l}}}function Gt(t){return t.replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g,"").replace(/\s+/g," ").trim().slice(0,180)}chrome.runtime.onInstalled.addListener(t=>{t.reason});
 // Fetches the raw video bytes on behalf of multi-select.js's "save straight
 // to a chosen folder" feature (File System Access API). This has to run
 // here in the service worker rather than in the content script: the
@@ -625,10 +1016,25 @@ function __arrayBufferToBase64(buffer) {
 // "Video đã chọn" (that folder IS the editor's root folder), and open a video
 // only after multi-select has finished writing it into that root's selected
 // direct subfolder.
+// It also hands the links ticked in "Video đã chọn" to TikdownTP ("Tải bằng
+// TikdownTP"): the host only drops a command file into TikdownTP's inbox and
+// TikdownTP itself fills its link box, sets the folder and presses Download.
 (() => {
   const HOST_NAME = 'com.tik_video_toolkit.editor_bridge';
   const SETTINGS_KEY = 'editorBridgeSettings';
   const MAX_TEXT = 4096;
+
+  // Where TikdownTP.exe / TikdownTP.py is (picked once with the host's file dialog).
+  // Kept apart from SETTINGS_KEY: readSettings() above only copies its own fields.
+  const TIKDOWNTP_SETTINGS_KEY = 'tikdownTPSettings';
+  // Same limits as the host (TIKDOWNTP_* in tik_native_host.py) and TikdownTP's inbox.
+  const TIKDOWNTP_MAX_NAME = 150;
+  const TIKDOWNTP_MAX_LINKS = 500;
+  const TIKDOWNTP_MAX_BATCHES = 50;
+  const TIKDOWNTP_MAX_LINK_LEN = 500;
+  const TIKDOWNTP_URL_RE = /^https:\/\/([a-z0-9-]+\.)*tiktok\.com\/\S+$/i;
+  // Host errors that mean "the saved TikdownTP file is no good": forget it and ask again.
+  const TIKDOWNTP_APP_ERRORS = new Set(['app_path_missing', 'app_path_invalid', 'app_not_found', 'app_bad_type']);
 
   const text = (value, limit = MAX_TEXT) =>
     typeof value === 'string' && value.length <= limit ? value.trim() : '';
@@ -699,9 +1105,66 @@ function __arrayBufferToBase64(buffer) {
     cancelled: !!(result && result.cancelled),
   });
 
+  const readTikdownTPApp = async () => {
+    try {
+      const result = await chrome.storage.local.get(TIKDOWNTP_SETTINGS_KEY);
+      const raw = result && result[TIKDOWNTP_SETTINGS_KEY];
+      return raw && typeof raw === 'object' ? text(raw.appPath) : '';
+    } catch {
+      return '';
+    }
+  };
+
+  const writeTikdownTPApp = async (appPath) => {
+    try {
+      if (appPath) await chrome.storage.local.set({ [TIKDOWNTP_SETTINGS_KEY]: { appPath } });
+      else await chrome.storage.local.remove(TIKDOWNTP_SETTINGS_KEY);
+    } catch {}
+  };
+
+  // [{ folderName, links }] from the page -> the same shape, checked: TikTok links only,
+  // no duplicates, within the host's limits. { ok: false, message } when something is off.
+  const cleanTikdownTPBatches = (raw) => {
+    if (!Array.isArray(raw) || !raw.length) return { ok: false, message: 'Chưa có video nào để gửi sang TikdownTP.' };
+    if (raw.length > TIKDOWNTP_MAX_BATCHES) {
+      return { ok: false, message: `Quá nhiều thư mục trong một lần gửi (tối đa ${TIKDOWNTP_MAX_BATCHES}).` };
+    }
+    const list = [];
+    const seenFolders = new Set();
+    let total = 0;
+    for (const entry of raw) {
+      if (!entry || typeof entry !== 'object') return { ok: false, message: 'Dữ liệu thư mục gửi sang TikdownTP không hợp lệ.' };
+      const folderName = typeof entry.folderName === 'string' ? entry.folderName.trim() : '';
+      if (folderName.length > 255 || seenFolders.has(folderName.toLowerCase())) {
+        return { ok: false, message: 'Tên thư mục con gửi sang TikdownTP không hợp lệ.' };
+      }
+      seenFolders.add(folderName.toLowerCase());
+      if (!Array.isArray(entry.links) || !entry.links.length) return { ok: false, message: 'Có thư mục không có video nào.' };
+      const links = [];
+      for (const item of entry.links) {
+        const link = typeof item === 'string' ? item.trim() : '';
+        if (!link || link.length > TIKDOWNTP_MAX_LINK_LEN || !TIKDOWNTP_URL_RE.test(link)) {
+          return { ok: false, message: 'Có link không phải link TikTok hợp lệ.' };
+        }
+        if (!links.includes(link)) links.push(link);
+      }
+      total += links.length;
+      if (total > TIKDOWNTP_MAX_LINKS) {
+        return { ok: false, message: `Quá nhiều video trong một lần gửi (tối đa ${TIKDOWNTP_MAX_LINKS}).` };
+      }
+      list.push({ folderName, links });
+    }
+    return { ok: true, list, total };
+  };
+
   const handle = async (message) => {
     if (!(await requireLicense())) {
-      return { success: false, message: 'Vui lòng kích hoạt key trước khi dùng app sửa video.' };
+      return {
+        success: false,
+        message: /TIKDOWNTP/.test(message.type)
+          ? 'Vui lòng kích hoạt key trước khi tải bằng TikdownTP.'
+          : 'Vui lòng kích hoạt key trước khi dùng app sửa video.',
+      };
     }
 
     if (message.type === 'EDITOR_BRIDGE_CHECK_APP') {
@@ -766,6 +1229,64 @@ function __arrayBufferToBase64(buffer) {
         return { success: false, message: 'Cầu nối trên máy chưa hỗ trợ mở thư mục. Hãy cập nhật thư mục native_host (bản .exe cần build lại bằng build_exe.bat) rồi chạy lại file cài.' };
       }
       return resultMessage(opened, 'Không mở được thư mục.');
+    }
+
+    // Nút "Tải bằng TikdownTP": chọn file TikdownTP.exe / TikdownTP.py một lần (hộp thoại của host)
+    // rồi nhớ đường dẫn. Hủy hộp thoại thì không lưu gì.
+    if (message.type === 'EDITOR_BRIDGE_PICK_TIKDOWNTP') {
+      const picked = await sendNative({ action: 'choose_app_file', purpose: 'tikdowntp' });
+      const result = resultMessage(picked, 'Không chọn được file TikdownTP.');
+      if (result.cancelled) return { success: false, cancelled: true, message: '' };
+      if (!result.success) return result;
+      if (!result.path) return { success: false, message: 'Không đọc được đường dẫn file TikdownTP vừa chọn.' };
+      await writeTikdownTPApp(result.path);
+      return result;
+    }
+
+    // Nút "Tải bằng TikdownTP": host ghi lệnh vào hộp thư của TikdownTP (mở app nếu chưa chạy) và chỉ
+    // báo ok khi TikdownTP đã NHẬN lệnh. rootPath/rootToken là thư mục chọn trong "Video đã chọn"
+    // (host kiểm tra marker .tvt); mỗi batch là một thư mục tải (folderName rỗng = chính thư mục gốc).
+    if (message.type === 'EDITOR_BRIDGE_SEND_TO_TIKDOWNTP') {
+      const appPath = await readTikdownTPApp();
+      if (!appPath) {
+        return { success: false, needApp: true, message: 'Chưa chọn file TikdownTP.exe hoặc TikdownTP.py.' };
+      }
+      const rootPath = text(message.rootPath, 1024);
+      const rootToken = text(message.rootToken, 128);
+      if (!isFullPath(rootPath)) return { success: false, message: 'Đường dẫn đầy đủ của thư mục tải về không hợp lệ.' };
+      if (!rootToken) return { success: false, message: 'Thiếu mã xác nhận của thư mục tải về.' };
+      const name = typeof message.name === 'string' ? message.name.trim() : '';
+      if (name.length > TIKDOWNTP_MAX_NAME) {
+        return { success: false, message: `Tên đặt khi tải quá dài (tối đa ${TIKDOWNTP_MAX_NAME} ký tự khi tải bằng TikdownTP).` };
+      }
+      const batches = cleanTikdownTPBatches(message.batches);
+      if (!batches.ok) return { success: false, message: batches.message };
+
+      const sent = await sendNative({
+        action: 'send_to_tikdowntp',
+        appPath,
+        rootPath,
+        rootToken,
+        name,
+        batches: batches.list,
+      });
+      if (sent && sent.ok === true) {
+        return { success: true, accepted: Number(sent.accepted) || batches.total, launched: sent.launched === true, message: '' };
+      }
+      const code = text(sent && sent.error, 60);
+      const detail = text(sent && sent.message, 600);
+      if (code === 'unknown_action') {
+        return {
+          success: false,
+          error: code,
+          message: 'Cầu nối trên máy chưa hỗ trợ gửi video sang TikdownTP. Hãy cập nhật thư mục native_host (bản .exe cần build lại bằng build_exe.bat) rồi chạy lại file cài.',
+        };
+      }
+      if (TIKDOWNTP_APP_ERRORS.has(code)) {
+        await writeTikdownTPApp('');
+        return { success: false, needApp: true, error: code, message: detail || 'Không dùng được file TikdownTP đã chọn.' };
+      }
+      return { success: false, error: code, message: detail || 'Không gửi được video sang TikdownTP.' };
     }
 
     if (message.type !== 'EDITOR_BRIDGE_OPEN_SAVED_VIDEO') return null;

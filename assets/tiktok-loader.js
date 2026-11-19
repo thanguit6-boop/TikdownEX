@@ -282,7 +282,7 @@
     if (message.type !== searchPipRequest) return;
 
     sendRuntimeMessage(
-      { type: 'GET_TIKTOK_METADATA', url: message.url },
+      { type: 'GET_TIKTOK_METADATA', url: message.url, priority: message.priority === 1 || message.priority === 2 ? message.priority : 0, refresh: message.refresh === true, playback: true },
       (result, runtimeError) => {
         const data = result?.success && result.data?.videoUrl
           ? {
@@ -302,6 +302,40 @@
         }, location.origin);
       },
     );
+  });
+
+  // Streams that TikTok itself delivered to this page: the MAIN-world hook finds them in the JSON of the page's API calls
+  // and posts them here. background.js keeps them only to answer PLAYBACK requests (hover preview, PiP, player window);
+  // a download never uses them. The hook holds what it found before this script was running and posts it again when
+  // __DOWNLOAD_PLAYER_BRIDGE_READY__ is dispatched below.
+  const pageStreamsType = '__DOWNLOAD_PAGE_STREAMS__';
+  const forwardPageStreams = (message) => {
+    if (!licenseKnown) {
+      whenLicenseKnown(() => forwardPageStreams(message));
+      return;
+    }
+    if (!extensionLicensed) return;
+    const streams = [];
+    for (const entry of message.streams.slice(0, 60)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const id = String(entry.id || '');
+      if (!/^\d{6,32}$/.test(id)) continue;
+      if (typeof entry.videoUrl !== 'string' || entry.videoUrl.length > 4096 || !/^https:\/\//i.test(entry.videoUrl)) continue;
+      streams.push({
+        id,
+        videoUrl: entry.videoUrl,
+        coverUrl: typeof entry.coverUrl === 'string' ? entry.coverUrl.slice(0, 4096) : '',
+        title: typeof entry.title === 'string' ? entry.title.slice(0, 300) : '',
+        author: typeof entry.author === 'string' ? entry.author.slice(0, 64) : '',
+      });
+    }
+    if (streams.length) sendRuntimeMessage({ type: 'TVT_PAGE_STREAMS', streams }, () => {});
+  };
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    const message = event.data;
+    if (!message || message.channel !== 'download' || message.type !== pageStreamsType || !Array.isArray(message.streams)) return;
+    forwardPageStreams(message);
   });
 
   // The MAIN-world hook waits for this before starting a requested player in

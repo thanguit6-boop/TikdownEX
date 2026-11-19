@@ -46,7 +46,9 @@ const LICENSE_RETRY_DELAY_MIN = 1;
 // a small enough revocation window for a shared host, while interaction-driven
 // checks below make the next protected use much faster.
 const LICENSE_CHECK_PERIOD_MIN = 5;
-const LICENSE_INTERACTIVE_CHECK_MAX_AGE_SEC = 60;
+// Same as the periodic alarm. A click, a page load or a worker wake-up reuses a verdict younger than this instead of
+// calling the license host again (it is a shared, slow host: the same one that resolves the PiP / player streams).
+const LICENSE_INTERACTIVE_CHECK_MAX_AGE_SEC = LICENSE_CHECK_PERIOD_MIN * 60;
 
 const LICENSE_K_MACHINE = 'tik_machine_id';
 const LICENSE_K_LICENSE = 'tik_license_v2';
@@ -1000,8 +1002,16 @@ if (chrome.alarms) {
   });
 }
 // Every time the worker wakes up: make sure the alarm exists and the UI flag matches the signed state.
+// This must not call the server by default: the worker wakes up every minute (auto-reload.js alarm) and each wake-up
+// used to POST a license check when the last one was older than a minute, i.e. a request per minute per install to the
+// same host that resolves the PiP / player streams. The flag is synced from the signed cache (no network); only a
+// state that can still recover (cache ran out or the network failed, not "no key" / a signed final verdict) is
+// re-checked now, the rest waits for the periodic alarm.
 licenseEnsureAlarm();
-licenseCheckIfStale().catch(() => {});
+licenseStatus().then((status) => {
+  if (status.licensed !== true && status.reason !== 'no_key' && status.final !== true) return licenseCheckIfStale();
+  return undefined;
+}).catch(() => {});
 
 export { isLicensed, getDownloadResolverProof, licenseStatus as getLicenseStatus, licenseActivate, licenseCheck, licenseCheckIfStale, licenseClear };
 // ===== [/Download] License module =====

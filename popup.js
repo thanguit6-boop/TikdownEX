@@ -92,6 +92,10 @@
   }
 
   async function refreshLicenseStatus() {
+    // Hiện ngay trạng thái đã lưu (chữ ký đã được xác minh, không gọi mạng) để mở khóa popup tức thì,
+    // rồi mới xác nhận lại với máy chủ (3-5 giây) ở nền. Không có bản lưu hợp lệ thì giữ "Đang kiểm tra…".
+    const cached = await sendLicenseMessage('LICENSE_STATUS');
+    if (cached.status && cached.status.licensed === true) paintLicenseStatus(cached.status, '');
     const result = await sendLicenseMessage('LICENSE_REVALIDATE');
     if (result.status) {
       // A short network outage may leave a still-valid signed offline cache.

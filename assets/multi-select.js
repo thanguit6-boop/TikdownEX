@@ -48,6 +48,7 @@
     const PANEL_CLOSE_ID = NS + "panel_close";
     const PANEL_DL_PICKED_ID = NS + "panel_dl_picked";
     const PANEL_DL_ALL_ID = NS + "panel_dl_all";
+    const PANEL_DL_TP_ID = NS + "panel_dl_tikdowntp";
     const ROW_CHECK_CLASS = NS + "row_check";
     const ROW_THUMB_CLASS = NS + "row_thumb";
     const ROW_STATUS_CLASS = NS + "row_status";
@@ -3733,6 +3734,9 @@
             '<div title="Tải xuống" style="width:36px;height:36px;flex:none;border-radius:10px;background:linear-gradient(135deg,#a855f7,#22d3ee);display:flex;align-items:center;justify-content:center;box-shadow:0 2px 10px rgba(168,85,247,.4);">' + footerDownloadIconSvg() + "</div>" +
             '<button type="button" id="' + PANEL_DL_PICKED_ID + '" title="Tải các video đã chọn" style="flex:1;height:36px;border:1.5px solid rgba(34,211,238,.55);border-radius:10px;background:rgba(34,211,238,.14);color:#67e8f9;font-weight:700;font-size:12.5px;cursor:pointer;">Đã chọn</button>' +
             '<button type="button" id="' + PANEL_DL_ALL_ID + '" title="Tải tất cả video trong danh sách" style="flex:1;height:36px;border:0;border-radius:10px;background:linear-gradient(135deg,#a855f7,#22d3ee);color:#fff;font-weight:700;font-size:12.5px;cursor:pointer;box-shadow:0 2px 10px rgba(168,85,247,.4);">Tất cả</button>' +
+            "</div>" +
+            '<div style="padding:0 12px 10px;flex:none;">' +
+            '<button type="button" id="' + PANEL_DL_TP_ID + '" title="Gửi các video đã tick sang TikdownTP để tải vào thư mục đã chọn (giữ Shift khi bấm để chọn lại file TikdownTP)" style="width:100%;height:36px;border:1.5px solid rgba(251,191,36,.55);border-radius:10px;background:rgba(251,191,36,.12);color:#fcd34d;font-weight:700;font-size:12.5px;cursor:pointer;">Tải bằng TikdownTP</button>' +
             "</div>";
         (document.body || document.documentElement).appendChild(panel);
 
@@ -3847,6 +3851,7 @@
         } catch {}
         panel.querySelector("#" + PANEL_DL_PICKED_ID).addEventListener("click", (ev) => onBatchDownloadClick(ev, true));
         panel.querySelector("#" + PANEL_DL_ALL_ID).addEventListener("click", (ev) => onBatchDownloadClick(ev, false));
+        panel.querySelector("#" + PANEL_DL_TP_ID).addEventListener("click", onTikdownTPClick);
         // Subfolder chips are re-ordered by dragging. This must be attached
         // BEFORE the capturing stopPropagation() loop right below: that loop
         // swallows pointerdown for everything inside the panel (the chips
@@ -4114,7 +4119,7 @@
     const downloadingUrls = new Set();
 
     function setBatchButtonsBusy(busy) {
-        for (const id of [PANEL_DL_PICKED_ID, PANEL_DL_ALL_ID]) {
+        for (const id of [PANEL_DL_PICKED_ID, PANEL_DL_ALL_ID, PANEL_DL_TP_ID]) {
             const btn = document.getElementById(id);
             if (!btn) continue;
             btn.disabled = busy;
@@ -4247,6 +4252,201 @@
                 "warn",
                 6000
             );
+        }
+    }
+
+    /* ---------------- "Tải bằng TikdownTP" ----------------
+     * Sends the ticked videos to TikdownTP instead of downloading them here:
+     *   - links: the TikTok page links of the ticked rows (query string dropped);
+     *   - name: the text of "Đặt tên khi tải" (TikdownTP adds its own numbering when a batch has several links);
+     *   - folder: the root folder chosen in "Video đã chọn", plus - in advanced mode - each row's
+     *     subfolder, one TikdownTP batch per folder. Chrome hides real paths, so the real path of the
+     *     root is found like for "Mở thư mục" (marker file + native host).
+     * The native host drops a command file in TikdownTP's inbox (opening TikdownTP first when it is not
+     * running); TikdownTP then fills its link box and name box, sets the folder and presses Start. The
+     * host only answers ok once TikdownTP has ACCEPTED the command, and only then do the videos leave
+     * the list; on any error they stay, so the button can simply be pressed again.
+     * Holding Shift while clicking asks for the TikdownTP file again (it is picked once and remembered).
+     */
+    const TIKDOWNTP_MAX_NAME_LENGTH = 150; // keep in sync with TIKDOWNTP_MAX_NAME_LEN in tik_native_host.py
+    const TIKDOWNTP_MAX_LINKS = 500; // keep in sync with TIKDOWNTP_MAX_LINKS in tik_native_host.py
+    const TIKDOWNTP_SEND_TOAST_MS = 30000;
+
+    // The video page without query string / fragment: search results add long tracking parameters and
+    // the host accepts links up to 500 characters only.
+    function tikdownTPLink(url) {
+        try {
+            const parsed = new URL(url);
+            return parsed.origin + parsed.pathname;
+        } catch {
+            return "";
+        }
+    }
+
+    // Real path + token of the folder chosen in "Video đã chọn" (same steps as runOpenDownloadFolder,
+    // also while "Mở app sửa video" is off). { ok: true, rootPath, rootToken } or { ok: false, text }.
+    async function resolveRootForTikdownTP() {
+        if (!rootDirLoaded) return { ok: false, text: "Đang tải thông tin thư mục, hãy thử lại sau giây lát." };
+        if (!rootDirHandle) {
+            return { ok: false, text: "Chưa chọn thư mục lưu video. Nhấp ô thư mục phía trên danh sách để chọn, TikdownTP sẽ tải vào thư mục đó." };
+        }
+        const rootName = typeof rootDirHandle.name === "string" ? rootDirHandle.name.trim() : "";
+        if (!rootName) return { ok: false, text: "Không đọc được tên thư mục đã chọn." };
+        let permission = await queryRootPermission();
+        if (permission !== "granted") permission = await requestRootPermission();
+        refreshSavePathUI();
+        if (permission !== "granted") {
+            return { ok: false, text: "Chưa có quyền với thư mục đã chọn. Nhấp ô thư mục để cấp lại quyền." };
+        }
+        let settings = await readEditorBridgeSettings();
+        let token = await editorRootToken();
+        if (!isEditorRootResolved(settings, rootName, token)) {
+            const found = await syncEditorRootFromList({ force: true });
+            if (found.busy) return { ok: false, text: found.text + " Hãy thử lại sau ít giây." };
+            if (!found.ok || !found.token) {
+                return { ok: false, text: found.text || "Không tìm được đường dẫn thật của thư mục." };
+            }
+            settings = await readEditorBridgeSettings();
+            token = found.token;
+        }
+        if (!settings.rootPath) return { ok: false, text: "Chưa xác định được đường dẫn thật của thư mục đã chọn." };
+        return { ok: true, rootPath: settings.rootPath, rootToken: token };
+    }
+
+    // Asks the native host to open its file dialog for TikdownTP.exe / TikdownTP.py (the service worker
+    // remembers the answer). { ok: true } / { ok: false, cancelled?, text }.
+    async function pickTikdownTPApp() {
+        showCenterToast("Chọn file TikdownTP.exe (hoặc TikdownTP.py) trong hộp thoại vừa mở.", "ok", 25000);
+        const picked = await sendMessage({ type: "EDITOR_BRIDGE_PICK_TIKDOWNTP" });
+        if (picked && picked.cancelled) return { ok: false, cancelled: true, text: "Đã hủy chọn file TikdownTP." };
+        if (!picked || !picked.success) {
+            return { ok: false, text: (picked && (picked.message || picked.error)) || "Không chọn được file TikdownTP." };
+        }
+        return { ok: true };
+    }
+
+    // { ok, cancelled?, text }. opts.repick: ask for the TikdownTP file again first (Shift + click).
+    async function runSendToTikdownTP(opts) {
+        const ticked = Array.from(selected.values()).filter((i) => i.picked !== false);
+        if (!ticked.length) return { ok: false, text: "Chưa tick video nào trong danh sách để gửi sang TikdownTP." };
+        // A video that is being saved right now (its own row button, a running batch, "Mở app sửa video")
+        // must not be sent as well.
+        const items = ticked.filter((i) => !downloadingUrls.has(i.url) && !editorOpeningUrls.has(i.url));
+        if (!items.length) return { ok: false, text: "Các video đã tick đang được tải, hãy thử lại sau khi tải xong." };
+        if (!rootDirLoaded) return { ok: false, text: "Đang tải thông tin thư mục, hãy thử lại sau giây lát." };
+        if (!rootDirHandle) {
+            return { ok: false, text: "Chưa chọn thư mục lưu video. Nhấp ô thư mục phía trên danh sách để chọn, TikdownTP sẽ tải vào thư mục đó." };
+        }
+        if (items.length > TIKDOWNTP_MAX_LINKS) {
+            return { ok: false, text: "Chỉ gửi được tối đa " + TIKDOWNTP_MAX_LINKS + " video mỗi lần. Hãy bỏ tick bớt video rồi gửi lại." };
+        }
+        if (!(await confirmRenameBeforeDownload())) return { ok: false, cancelled: true };
+        const resolved = await resolveDownloadBatch(items);
+        if (!resolved) return { ok: false, cancelled: true };
+        // The modals above can take a while: only what is still in the list counts.
+        const sending = resolved.filter((i) => selected.has(i.url) && !downloadingUrls.has(i.url));
+        if (!sending.length) return { ok: false, text: "Không còn video nào để gửi sang TikdownTP." };
+
+        // One TikdownTP batch per target folder: the chosen root, or - in advanced mode - the row's subfolder.
+        const groups = new Map();
+        for (const item of sending) {
+            const link = tikdownTPLink(item.url);
+            if (!link) return { ok: false, text: "Có video không có link hợp lệ." };
+            const folderName = advancedFolderMode && typeof item.folderName === "string" ? item.folderName : "";
+            if (!groups.has(folderName)) groups.set(folderName, []);
+            groups.get(folderName).push(link);
+        }
+
+        const root = await resolveRootForTikdownTP();
+        if (!root.ok) return root;
+        // Never let the host create a folder for a mapping that went stale (deleted / renamed folder).
+        for (const folderName of groups.keys()) {
+            if (!folderName) continue;
+            try {
+                await rootDirHandle.getDirectoryHandle(folderName, { create: false });
+            } catch {
+                // Wait for the rescan: it clears the stale mapping (and shows its own toast) before ours.
+                await rescanFolders();
+                return { ok: false, text: 'Không tìm thấy thư mục "' + folderName + '" (đã bị xóa hoặc đổi tên). Danh sách thư mục đã được làm mới, hãy chọn lại thư mục cho video rồi gửi lại.' };
+            }
+        }
+        // Read the name only now, after the modals: the user may have typed it there.
+        const renameInput = document.getElementById(PANEL_RENAME_INPUT_ID);
+        const name = sanitizeFsName(normalizeRenameBase(renameInput ? renameInput.value : renameDraft));
+        if (name.length > TIKDOWNTP_MAX_NAME_LENGTH) {
+            return { ok: false, text: "Tên đặt khi tải quá dài (tối đa " + TIKDOWNTP_MAX_NAME_LENGTH + " ký tự khi tải bằng TikdownTP)." };
+        }
+
+        let askedApp = false;
+        if (opts && opts.repick) {
+            const picked = await pickTikdownTPApp();
+            if (!picked.ok) return picked;
+            askedApp = true;
+        }
+        const request = {
+            type: "EDITOR_BRIDGE_SEND_TO_TIKDOWNTP",
+            rootPath: root.rootPath,
+            rootToken: root.rootToken,
+            name,
+            batches: Array.from(groups, ([folderName, links]) => ({ folderName, links })),
+        };
+        // Same guard as a download in progress, until the answer is in.
+        for (const item of sending) downloadingUrls.add(item.url);
+        let res;
+        try {
+            for (;;) {
+                showCenterToast(
+                    "Đang gửi " + sending.length + " video sang TikdownTP… (tự mở TikdownTP nếu chưa chạy)",
+                    "ok",
+                    TIKDOWNTP_SEND_TOAST_MS
+                );
+                res = await sendMessage(request);
+                // No (or a wrong) TikdownTP file saved yet: ask once, then try again.
+                if (res && res.needApp && !askedApp) {
+                    askedApp = true;
+                    const picked = await pickTikdownTPApp();
+                    if (!picked.ok) return picked;
+                    continue;
+                }
+                break;
+            }
+        } finally {
+            for (const item of sending) downloadingUrls.delete(item.url);
+        }
+        if (!res || !res.success) {
+            return { ok: false, text: (res && (res.message || res.error)) || "Không gửi được video sang TikdownTP." };
+        }
+        // TikdownTP has taken them over: they leave the list (not marked "Đã tải" on the cards - the
+        // download itself is only starting).
+        for (const item of sending) {
+            if (selected.has(item.url)) removeSelection(item.url);
+        }
+        return {
+            ok: true,
+            text: "✓ Đã gửi " + sending.length + " video sang TikdownTP" + (res.launched ? " (đã mở TikdownTP)" : "") + ", TikdownTP sẽ tự tải.",
+        };
+    }
+
+    // Shift + click: choose the TikdownTP file again.
+    async function onTikdownTPClick(ev) {
+        stopCardEvent(ev);
+        if (batchDownloadBusy) return;
+        batchDownloadBusy = true;
+        setBatchButtonsBusy(true);
+        try {
+            const result = await runSendToTikdownTP({ repick: ev.shiftKey === true });
+            if (result.ok) {
+                showCenterToast(result.text, "ok", 6000);
+            } else if (result.cancelled) {
+                hideCenterToast();
+            } else {
+                showCenterToast(result.text, "warn", result.text.length > 90 ? 9000 : 5000);
+            }
+        } catch (e) {
+            showCenterToast((e && e.message) || "Không gửi được video sang TikdownTP.", "warn", 5000);
+        } finally {
+            batchDownloadBusy = false;
+            setBatchButtonsBusy(false);
         }
     }
 

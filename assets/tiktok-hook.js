@@ -1,4 +1,4 @@
-(function(){(function(){var N,G,W,z;if(window.__DOWNLOAD_HOOK__)return;window.__DOWNLOAD_HOOK__=!0;const b=()=>{};let q="",P=null;function ee(){try{const e=location.pathname.match(/^\/@([^/?#]+)/);return e?e[1]:""}catch{return""}}function te(e){if(!e||typeof e!="object")return!1;const r=e.commerceUserInfo;if(r&&typeof r=="object"&&(r.commerceUser===!0||typeof r.category=="string"&&r.category.length>0||typeof r.sellerLevel=="number"&&r.sellerLevel>0||r.starInfo&&typeof r.starInfo=="object")||e.ttSeller===!0)return!0;if(e.bioLink&&typeof e.bioLink=="object"){const d=String(e.bioLink.link||"");if(/tiktok\.com\/.*\/shop|\/shop\/|tiktok\.com\/@[^/]+\/shop/i.test(d))return!0}return!1}let p={backgroundPlay:!1,autoPiP:!1,volumeNormalizer:!1,playbackSpeed:1};const M=(N=Object.getOwnPropertyDescriptor(Document.prototype,"hidden"))==null?void 0:N.get,F=(G=Object.getOwnPropertyDescriptor(Document.prototype,"visibilityState"))==null?void 0:G.get;function _(){return M?!!M.call(document):!1}const re=window.requestAnimationFrame.bind(window),oe=window.cancelAnimationFrame.bind(window);let D=!1;function ne(){D||(D=!0,window.requestAnimationFrame=e=>_()?window.setTimeout(()=>e(performance.now()),16):re(e),window.cancelAnimationFrame=e=>{_()?window.clearTimeout(e):oe(e)})}ne(),window.addEventListener("__download_settings__",e=>{const r=e.detail;r&&typeof r=="object"&&(p={...p,...r},K(),C(),A())});try{Object.defineProperty(document,"hidden",{configurable:!0,get(){return p.backgroundPlay?!1:_()}}),Object.defineProperty(document,"visibilityState",{configurable:!0,get(){return p.backgroundPlay?"visible":F?F.call(document):"visible"}})}catch{}let x=!1;function ie(){return p.autoPiP&&(_()||!document.hasFocus())}async function E(e){if(!ie()||x)return;const r=j();if(!(!r||document.pictureInPictureElement===r)){x=!0;try{T(r),await r.requestPictureInPicture()}catch{B()}finally{x=!1}}}function A(e){setTimeout(()=>E(),250),setTimeout(()=>E(),700),setTimeout(()=>E(),1400),setTimeout(()=>E(),2400)}async function R(){if(document.pictureInPictureElement)try{await document.exitPictureInPicture()}catch{}}const U=e=>{e.isTrusted&&(p.autoPiP&&(e.type==="visibilitychange"?_()?A():R():e.type==="blur"?setTimeout(()=>{document.hasFocus()||A()},150):e.type==="focus"&&R()),p.backgroundPlay&&e.stopImmediatePropagation())};for(const e of["visibilitychange","pagehide","blur","focus"])window.addEventListener(e,U,!0),document.addEventListener(e,U,!0);function ce(){document.querySelectorAll("video").forEach(e=>{const r=p.playbackSpeed||1;if(Math.abs(e.playbackRate-r)>.01)try{e.playbackRate=r}catch{}})}const v=((W=window.AudioContext)==null?void 0:W.prototype)||((z=window.webkitAudioContext)==null?void 0:z.prototype),V=v==null?void 0:v.createMediaElementSource;if(v&&V){const e=new WeakSet;v.createMediaElementSource=function(r){const d=V.call(this,r);if(e.has(r))return d;e.add(r);try{const h=this,c=h.createDynamicsCompressor();c.threshold.value=-24,c.knee.value=30,c.ratio.value=12,c.attack.value=.003,c.release.value=.25;const g=h.createGain();g.gain.value=1.5;const s=d.connect;let a=!0;d.connect=function(f,y,k){return a&&(a=!1,p.volumeNormalizer)?(s.call(this,c),c.connect(g),g.connect(f,y,k),f):s.call(this,f,y,k)}}catch{}return d}}function C(){if("mediaSession"in navigator)try{navigator.mediaSession.setActionHandler("enterpictureinpicture",async()=>{if(!p.autoPiP)return;const e=j();if(e){T(e);try{await e.requestPictureInPicture()}catch{B()}}}),navigator.mediaSession.setActionHandler("nexttrack",()=>{ae(),setTimeout(O,100),A("media-nexttrack")}),navigator.mediaSession.setActionHandler("previoustrack",()=>{le(),setTimeout(O,100),A("media-previoustrack")})}catch{}}function T(e){e.removeAttribute("disablepictureinpicture"),e.disablePictureInPicture=!1,p.autoPiP?(e.setAttribute("autopictureinpicture","true"),e.autoPictureInPicture=!0):(e.removeAttribute("autopictureinpicture"),e.autoPictureInPicture=!1)}function se(){document.querySelectorAll("video").forEach(e=>{try{T(e),e.__downloadHookPipPlaying||(e.__downloadHookPipPlaying=!0,e.addEventListener("playing",()=>{const r=document.pictureInPictureElement;if(!(!p.autoPiP||!r||r===e))try{T(e),e.requestPictureInPicture().catch(()=>{})}catch{}}))}catch{}})}function O(){if(!p.autoPiP||!("mediaSession"in navigator))return;const e=j();if(e)try{document.pictureInPictureElement||(navigator.mediaSession.metadata=new MediaMetadata({title:"Download",artist:"Auto PiP Enabled",artwork:[]})),navigator.mediaSession.playbackState=e.paused?"paused":"playing"}catch{}}function B(){var e;try{(e=document.querySelector('[data-e2e="more-menu-popover_mini-player"]'))==null||e.click()}catch{}}function ae(){const e=document.querySelector('[data-e2e="arrow-right"], [data-e2e="arrow-down"], button[data-e2e="video-switch-next"]');if(e){e.click();return}(document.querySelector('[data-e2e="recommend-list-item-container"]')||document.getElementById("app")||document.documentElement).dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",code:"ArrowDown",keyCode:40,which:40,bubbles:!0,cancelable:!0,composed:!0,view:window})),setTimeout(()=>window.scrollBy({top:window.innerHeight,behavior:"smooth"}),150)}function le(){const e=document.querySelector('[data-e2e="arrow-left"], [data-e2e="arrow-up"], button[data-e2e="video-switch-prev"]');if(e){e.click();return}(document.querySelector('[data-e2e="recommend-list-item-container"]')||document.getElementById("app")||document.documentElement).dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowUp",code:"ArrowUp",keyCode:38,which:38,bubbles:!0,cancelable:!0,composed:!0,view:window})),setTimeout(()=>window.scrollBy({top:-window.innerHeight,behavior:"smooth"}),150)}function j(){var d;const e=Array.from(document.querySelectorAll("video"));if(!e.length)return null;const r=window.innerHeight/2;return((d=e.map(h=>{const c=h.getBoundingClientRect(),g=Math.max(0,Math.min(c.bottom,window.innerHeight)-Math.max(c.top,0)),s=Math.max(0,Math.min(c.right,window.innerWidth)-Math.max(c.left,0)),a=g*s,f=Math.abs((c.top+c.bottom)/2-r),y=(h.paused?0:1e6)+(h.readyState>=2?1e5:0)+a-f;return{video:h,score:y}}).sort((h,c)=>c.score-h.score)[0])==null?void 0:d.video)||null}function K(){ce(),se(),O()}C(),setInterval(C,2e3),setInterval(K,1e3);try{const e=window.fetch;window.fetch=function(...r){var h;const p=e.apply(this,r);p.then(d=>{try{const c=typeof r[0]=="string"?r[0]:r[0]instanceof Request?r[0].url:((h=r[0])==null?void 0:h.url)||"";typeof c=="string"&&/tiktok\.com\/api\//.test(c)&&!/\/inbox\/|\/notice|\/check\b/i.test(c)&&d.clone().json().then(s=>{var Y,$,J,Q,X;let a=[];if(Array.isArray(s==null?void 0:s.itemList))a=s.itemList;else if(Array.isArray(s==null?void 0:s.items))a=s.items;else if(Array.isArray(s==null?void 0:s.aweme_list))a=s.aweme_list;else if(s&&typeof s=="object")for(const t of Object.keys(s)){const n=s[t];if(Array.isArray(n)&&n.length&&n[0]&&typeof n[0]=="object"){if((n[0].id||n[0].aweme_id)&&(n[0].author||n[0].video||n[0].music)){a=n;break}const wKey=n[0].item?"item":(n[0].aweme_info?"aweme_info":null);if(wKey&&n[0][wKey]&&(n[0][wKey].id||n[0][wKey].aweme_id)&&(n[0][wKey].author||n[0][wKey].video||n[0][wKey].music)){a=n.map(x=>x&&x[wKey]).filter(Boolean);break}}}if(!a.length)return;b("item_list response:",c.slice(0,120),"items=",a.length);const f=ee();if(f&&q!==f&&(q=f,P=null,b("profile owner changed →",f,"(reset shop flag)")),f&&P===null){let t=!1;for(const n of a)if(((Y=n==null?void 0:n.author)==null?void 0:Y.uniqueId)===f&&(t=!0,te(n.author))){P=!0;const m=n.author.commerceUserInfo,w=n.author.bioLink;b("profile owner",f,"detected as SHOP creator",{commerceUserInfo:m?Object.keys(m).slice(0,10):null,ttSeller:n.author.ttSeller,bioLink:w&&typeof w=="object"?w.link:null});break}P===null&&t&&(P=!1,b("profile owner",f,"detected as NON-shop creator"))}try{window.postMessage({type:"__DOWNLOAD_PROBE_URL__",url:c.slice(0,200)+" → items: "+a.length},"*")}catch{}const y=[],k=[],H=[];for(const t of a){if(!t)continue;const n=String(t.id||t.video_id||t.aweme_id||"");if(!n||!/^\d{6,}$/.test(n))continue;let m=!1;if(Array.isArray(t.anchors))for(const i of t.anchors){if(!i||i.type!==33)continue;const u=String(i.schema||i.action_url||""),o=i.extra||{},S=/\/shop\//.test(u)||!!o.product_id||!!o.shop_id,L=typeof i.keyword=="string"?i.keyword:"",fe=/capcut|edit like|editing made|template|effect/i.test(L);if(S||L&&!fe){m=!0;break}if(!L&&!u&&!Object.keys(o).length){m=!0;break}}if(!m&&Array.isArray(t.anchors_extras)){for(const i of t.anchors_extras)if(i&&(i.type===33||i.anchor_type===33)){m=!0;break}}if(!m&&Array.isArray(t.contents)){for(const i of t.contents)if(i){if(Array.isArray(i.anchors)){for(const u of i.anchors)if(u&&u.type===33){m=!0;break}}if(m)break}}let w=!1;const l=t.commerceProductInfo||t.commerce_product_info;if(l&&typeof l=="object"){const i=l.products||l.product_list;if(Array.isArray(i)&&i.length>0){const u=i[0];u&&(u.product_id||u.title)&&(w=!0)}else(l.product_id||l.title)&&(w=!0)}let I=!1,Z=!1;!m&&!w&&(t.isECVideo===1||t.isECVideo===!0)&&(Array.isArray(t.anchors)&&t.anchors.some(u=>u&&u.type===54)?P===!0&&(I=!0,Z=!0):I=!0);const ue=m||w||I;if(H.length<5){const i=Array.isArray(t.anchors)?t.anchors.map(o=>({type:o==null?void 0:o.type,keyword:typeof(o==null?void 0:o.keyword)=="string"?o.keyword.slice(0,40):o==null?void 0:o.keyword,extra_keys:o!=null&&o.extra&&typeof o.extra=="object"?Object.keys(o.extra).slice(0,10):null})):null,u=l&&typeof l=="object"?{keys:Object.keys(l).slice(0,10),productsLen:Array.isArray(l.products)?l.products.length:null,product0_id:(J=($=l.products)==null?void 0:$[0])==null?void 0:J.product_id,product0_title:typeof((X=(Q=l.products)==null?void 0:Q[0])==null?void 0:X.title)=="string"?l.products[0].title.slice(0,40):null,direct_product_id:l.product_id,direct_title:typeof l.title=="string"?l.title.slice(0,40):null}:null;H.push({id:n,hasShopAnchor:m,hasRealCommerceProduct:w,relaxedByProfileShop:Z,anchorsDump:i,AnchorTypes:t.AnchorTypes,isECVideo:t.isECVideo,cpiDump:u,anchors_extras:Array.isArray(t.anchors_extras)?t.anchors_extras.map(o=>({type:o==null?void 0:o.type,anchor_type:o==null?void 0:o.anchor_type,keys:o?Object.keys(o).slice(0,8):null})):t.anchors_extras,contents_summary:Array.isArray(t.contents)?t.contents.map(o=>({desc:typeof(o==null?void 0:o.desc)=="string"?o.desc.slice(0,60):null,anchorTypes:Array.isArray(o==null?void 0:o.anchors)?o.anchors.map(S=>S==null?void 0:S.type):null})):null,desc:typeof t.desc=="string"?t.desc.slice(0,120):null,itemKeys:Object.keys(t).filter(o=>/commerce|product|anchor|shop|ec|tcm/i.test(o)),allKeys:Object.keys(t).slice(0,40)})}ue?y.push(n):!I&&(t.isECVideo===0||t.isECVideo===!1||t.isECVideo===void 0)&&!t.AnchorTypes&&(Array.isArray(t.anchors)&&t.anchors.some(u=>u&&u.type===54)||k.push(n))}const _ks=window.__downloadKnownShop||(window.__downloadKnownShop=new Set());for(const x of a){if(x&&x.author&&x.author.uniqueId&&te(x.author))_ks.add(x.author.uniqueId)}let _upg=0;for(const x of a){if(!x||!x.author||!x.author.uniqueId)continue;if(_ks.has(x.author.uniqueId)){const id=x.id||x.aweme_id;if(!id)continue;const ni=k.indexOf(id);if(ni>=0)k.splice(ni,1);if(!y.includes(id)){y.push(id);_upg++}}}b("[D7] knownShopCreators set:",_ks.size,"upgraded ids=",_upg),b("item_list classified: total=",a.length," shop=",y.length," nonShop=",k.length," unclassified=",a.length-y.length-k.length),window.postMessage({type:"__DOWNLOAD_PROFILE_POSTS__",shopIds:y,nonShopIds:k,total:a.length,sample:H},"*")}).catch(()=>{})}catch{}}).catch(()=>{});return p}}catch{}
+(function(){(function(){var N,G,W,z;if(window.__DOWNLOAD_HOOK__)return;window.__DOWNLOAD_HOOK__=!0;const b=()=>{};let q="",P=null;function ee(){try{const e=location.pathname.match(/^\/@([^/?#]+)/);return e?e[1]:""}catch{return""}}function te(e){if(!e||typeof e!="object")return!1;const r=e.commerceUserInfo;if(r&&typeof r=="object"&&(r.commerceUser===!0||typeof r.category=="string"&&r.category.length>0||typeof r.sellerLevel=="number"&&r.sellerLevel>0||r.starInfo&&typeof r.starInfo=="object")||e.ttSeller===!0)return!0;if(e.bioLink&&typeof e.bioLink=="object"){const d=String(e.bioLink.link||"");if(/tiktok\.com\/.*\/shop|\/shop\/|tiktok\.com\/@[^/]+\/shop/i.test(d))return!0}return!1}let p={backgroundPlay:!1,autoPiP:!1,volumeNormalizer:!1,playbackSpeed:1};const M=(N=Object.getOwnPropertyDescriptor(Document.prototype,"hidden"))==null?void 0:N.get,F=(G=Object.getOwnPropertyDescriptor(Document.prototype,"visibilityState"))==null?void 0:G.get;function _(){return M?!!M.call(document):!1}const re=window.requestAnimationFrame.bind(window),oe=window.cancelAnimationFrame.bind(window);let D=!1;function ne(){D||(D=!0,window.requestAnimationFrame=e=>_()?window.setTimeout(()=>e(performance.now()),16):re(e),window.cancelAnimationFrame=e=>{_()?window.clearTimeout(e):oe(e)})}ne(),window.addEventListener("__download_settings__",e=>{const r=e.detail;r&&typeof r=="object"&&(p={...p,...r},K(),C(),A())});try{Object.defineProperty(document,"hidden",{configurable:!0,get(){return p.backgroundPlay?!1:_()}}),Object.defineProperty(document,"visibilityState",{configurable:!0,get(){return p.backgroundPlay?"visible":F?F.call(document):"visible"}})}catch{}let x=!1;function ie(){return p.autoPiP&&(_()||!document.hasFocus())}async function E(e){if(!ie()||x)return;const r=j();if(!(!r||document.pictureInPictureElement===r)){x=!0;try{T(r),await r.requestPictureInPicture()}catch{B()}finally{x=!1}}}function A(e){setTimeout(()=>E(),250),setTimeout(()=>E(),700),setTimeout(()=>E(),1400),setTimeout(()=>E(),2400)}async function R(){if(document.pictureInPictureElement)try{await document.exitPictureInPicture()}catch{}}const U=e=>{e.isTrusted&&(p.autoPiP&&(e.type==="visibilitychange"?_()?A():R():e.type==="blur"?setTimeout(()=>{document.hasFocus()||A()},150):e.type==="focus"&&R()),p.backgroundPlay&&e.stopImmediatePropagation())};for(const e of["visibilitychange","pagehide","blur","focus"])window.addEventListener(e,U,!0),document.addEventListener(e,U,!0);function ce(){document.querySelectorAll("video").forEach(e=>{const r=p.playbackSpeed||1;if(Math.abs(e.playbackRate-r)>.01)try{e.playbackRate=r}catch{}})}const v=((W=window.AudioContext)==null?void 0:W.prototype)||((z=window.webkitAudioContext)==null?void 0:z.prototype),V=v==null?void 0:v.createMediaElementSource;if(v&&V){const e=new WeakSet;v.createMediaElementSource=function(r){const d=V.call(this,r);if(e.has(r))return d;e.add(r);try{const h=this,c=h.createDynamicsCompressor();c.threshold.value=-24,c.knee.value=30,c.ratio.value=12,c.attack.value=.003,c.release.value=.25;const g=h.createGain();g.gain.value=1.5;const s=d.connect;let a=!0;d.connect=function(f,y,k){return a&&(a=!1,p.volumeNormalizer)?(s.call(this,c),c.connect(g),g.connect(f,y,k),f):s.call(this,f,y,k)}}catch{}return d}}function C(){if("mediaSession"in navigator)try{navigator.mediaSession.setActionHandler("enterpictureinpicture",async()=>{if(!p.autoPiP)return;const e=j();if(e){T(e);try{await e.requestPictureInPicture()}catch{B()}}}),navigator.mediaSession.setActionHandler("nexttrack",()=>{ae(),setTimeout(O,100),A("media-nexttrack")}),navigator.mediaSession.setActionHandler("previoustrack",()=>{le(),setTimeout(O,100),A("media-previoustrack")})}catch{}}function T(e){e.removeAttribute("disablepictureinpicture"),e.disablePictureInPicture=!1,p.autoPiP?(e.setAttribute("autopictureinpicture","true"),e.autoPictureInPicture=!0):(e.removeAttribute("autopictureinpicture"),e.autoPictureInPicture=!1)}function se(){document.querySelectorAll("video").forEach(e=>{try{T(e),e.__downloadHookPipPlaying||(e.__downloadHookPipPlaying=!0,e.addEventListener("playing",()=>{const r=document.pictureInPictureElement;if(!(!p.autoPiP||!r||r===e))try{T(e),e.requestPictureInPicture().catch(()=>{})}catch{}}))}catch{}})}function O(){if(!p.autoPiP||!("mediaSession"in navigator))return;const e=j();if(e)try{document.pictureInPictureElement||(navigator.mediaSession.metadata=new MediaMetadata({title:"Download",artist:"Auto PiP Enabled",artwork:[]})),navigator.mediaSession.playbackState=e.paused?"paused":"playing"}catch{}}function B(){var e;try{(e=document.querySelector('[data-e2e="more-menu-popover_mini-player"]'))==null||e.click()}catch{}}function ae(){const e=document.querySelector('[data-e2e="arrow-right"], [data-e2e="arrow-down"], button[data-e2e="video-switch-next"]');if(e){e.click();return}(document.querySelector('[data-e2e="recommend-list-item-container"]')||document.getElementById("app")||document.documentElement).dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",code:"ArrowDown",keyCode:40,which:40,bubbles:!0,cancelable:!0,composed:!0,view:window})),setTimeout(()=>window.scrollBy({top:window.innerHeight,behavior:"smooth"}),150)}function le(){const e=document.querySelector('[data-e2e="arrow-left"], [data-e2e="arrow-up"], button[data-e2e="video-switch-prev"]');if(e){e.click();return}(document.querySelector('[data-e2e="recommend-list-item-container"]')||document.getElementById("app")||document.documentElement).dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowUp",code:"ArrowUp",keyCode:38,which:38,bubbles:!0,cancelable:!0,composed:!0,view:window})),setTimeout(()=>window.scrollBy({top:-window.innerHeight,behavior:"smooth"}),150)}function j(){var d;const e=Array.from(document.querySelectorAll("video"));if(!e.length)return null;const r=window.innerHeight/2;return((d=e.map(h=>{const c=h.getBoundingClientRect(),g=Math.max(0,Math.min(c.bottom,window.innerHeight)-Math.max(c.top,0)),s=Math.max(0,Math.min(c.right,window.innerWidth)-Math.max(c.left,0)),a=g*s,f=Math.abs((c.top+c.bottom)/2-r),y=(h.paused?0:1e6)+(h.readyState>=2?1e5:0)+a-f;return{video:h,score:y}}).sort((h,c)=>c.score-h.score)[0])==null?void 0:d.video)||null}function K(){ce(),se(),O()}C(),setInterval(C,2e3),setInterval(K,1e3);try{const e=window.fetch;window.fetch=function(...r){var h;const p=e.apply(this,r);p.then(d=>{try{const c=typeof r[0]=="string"?r[0]:r[0]instanceof Request?r[0].url:((h=r[0])==null?void 0:h.url)||"";typeof c=="string"&&/tiktok\.com\/api\//.test(c)&&!/\/inbox\/|\/notice|\/check\b/i.test(c)&&d.clone().json().then(s=>{var Y,$,J,Q,X;let a=[];if(Array.isArray(s==null?void 0:s.itemList))a=s.itemList;else if(Array.isArray(s==null?void 0:s.items))a=s.items;else if(Array.isArray(s==null?void 0:s.aweme_list))a=s.aweme_list;else if(s&&typeof s=="object")for(const t of Object.keys(s)){const n=s[t];if(Array.isArray(n)&&n.length&&n[0]&&typeof n[0]=="object"){if((n[0].id||n[0].aweme_id)&&(n[0].author||n[0].video||n[0].music)){a=n;break}const wKey=n[0].item?"item":(n[0].aweme_info?"aweme_info":null);if(wKey&&n[0][wKey]&&(n[0][wKey].id||n[0][wKey].aweme_id)&&(n[0][wKey].author||n[0][wKey].video||n[0][wKey].music)){a=n.map(x=>x&&x[wKey]).filter(Boolean);break}}}if(!a.length)return;try{window.__tvtCapturePageStreams&&window.__tvtCapturePageStreams(a)}catch{}b("item_list response:",c.slice(0,120),"items=",a.length);const f=ee();if(f&&q!==f&&(q=f,P=null,b("profile owner changed →",f,"(reset shop flag)")),f&&P===null){let t=!1;for(const n of a)if(((Y=n==null?void 0:n.author)==null?void 0:Y.uniqueId)===f&&(t=!0,te(n.author))){P=!0;const m=n.author.commerceUserInfo,w=n.author.bioLink;b("profile owner",f,"detected as SHOP creator",{commerceUserInfo:m?Object.keys(m).slice(0,10):null,ttSeller:n.author.ttSeller,bioLink:w&&typeof w=="object"?w.link:null});break}P===null&&t&&(P=!1,b("profile owner",f,"detected as NON-shop creator"))}try{window.postMessage({type:"__DOWNLOAD_PROBE_URL__",url:c.slice(0,200)+" → items: "+a.length},"*")}catch{}const y=[],k=[],H=[];for(const t of a){if(!t)continue;const n=String(t.id||t.video_id||t.aweme_id||"");if(!n||!/^\d{6,}$/.test(n))continue;let m=!1;if(Array.isArray(t.anchors))for(const i of t.anchors){if(!i||i.type!==33)continue;const u=String(i.schema||i.action_url||""),o=i.extra||{},S=/\/shop\//.test(u)||!!o.product_id||!!o.shop_id,L=typeof i.keyword=="string"?i.keyword:"",fe=/capcut|edit like|editing made|template|effect/i.test(L);if(S||L&&!fe){m=!0;break}if(!L&&!u&&!Object.keys(o).length){m=!0;break}}if(!m&&Array.isArray(t.anchors_extras)){for(const i of t.anchors_extras)if(i&&(i.type===33||i.anchor_type===33)){m=!0;break}}if(!m&&Array.isArray(t.contents)){for(const i of t.contents)if(i){if(Array.isArray(i.anchors)){for(const u of i.anchors)if(u&&u.type===33){m=!0;break}}if(m)break}}let w=!1;const l=t.commerceProductInfo||t.commerce_product_info;if(l&&typeof l=="object"){const i=l.products||l.product_list;if(Array.isArray(i)&&i.length>0){const u=i[0];u&&(u.product_id||u.title)&&(w=!0)}else(l.product_id||l.title)&&(w=!0)}let I=!1,Z=!1;!m&&!w&&(t.isECVideo===1||t.isECVideo===!0)&&(Array.isArray(t.anchors)&&t.anchors.some(u=>u&&u.type===54)?P===!0&&(I=!0,Z=!0):I=!0);const ue=m||w||I;if(H.length<5){const i=Array.isArray(t.anchors)?t.anchors.map(o=>({type:o==null?void 0:o.type,keyword:typeof(o==null?void 0:o.keyword)=="string"?o.keyword.slice(0,40):o==null?void 0:o.keyword,extra_keys:o!=null&&o.extra&&typeof o.extra=="object"?Object.keys(o.extra).slice(0,10):null})):null,u=l&&typeof l=="object"?{keys:Object.keys(l).slice(0,10),productsLen:Array.isArray(l.products)?l.products.length:null,product0_id:(J=($=l.products)==null?void 0:$[0])==null?void 0:J.product_id,product0_title:typeof((X=(Q=l.products)==null?void 0:Q[0])==null?void 0:X.title)=="string"?l.products[0].title.slice(0,40):null,direct_product_id:l.product_id,direct_title:typeof l.title=="string"?l.title.slice(0,40):null}:null;H.push({id:n,hasShopAnchor:m,hasRealCommerceProduct:w,relaxedByProfileShop:Z,anchorsDump:i,AnchorTypes:t.AnchorTypes,isECVideo:t.isECVideo,cpiDump:u,anchors_extras:Array.isArray(t.anchors_extras)?t.anchors_extras.map(o=>({type:o==null?void 0:o.type,anchor_type:o==null?void 0:o.anchor_type,keys:o?Object.keys(o).slice(0,8):null})):t.anchors_extras,contents_summary:Array.isArray(t.contents)?t.contents.map(o=>({desc:typeof(o==null?void 0:o.desc)=="string"?o.desc.slice(0,60):null,anchorTypes:Array.isArray(o==null?void 0:o.anchors)?o.anchors.map(S=>S==null?void 0:S.type):null})):null,desc:typeof t.desc=="string"?t.desc.slice(0,120):null,itemKeys:Object.keys(t).filter(o=>/commerce|product|anchor|shop|ec|tcm/i.test(o)),allKeys:Object.keys(t).slice(0,40)})}ue?y.push(n):!I&&(t.isECVideo===0||t.isECVideo===!1||t.isECVideo===void 0)&&!t.AnchorTypes&&(Array.isArray(t.anchors)&&t.anchors.some(u=>u&&u.type===54)||k.push(n))}const _ks=window.__downloadKnownShop||(window.__downloadKnownShop=new Set());for(const x of a){if(x&&x.author&&x.author.uniqueId&&te(x.author))_ks.add(x.author.uniqueId)}let _upg=0;for(const x of a){if(!x||!x.author||!x.author.uniqueId)continue;if(_ks.has(x.author.uniqueId)){const id=x.id||x.aweme_id;if(!id)continue;const ni=k.indexOf(id);if(ni>=0)k.splice(ni,1);if(!y.includes(id)){y.push(id);_upg++}}}b("[D7] knownShopCreators set:",_ks.size,"upgraded ids=",_upg),b("item_list classified: total=",a.length," shop=",y.length," nonShop=",k.length," unclassified=",a.length-y.length-k.length),window.postMessage({type:"__DOWNLOAD_PROFILE_POSTS__",shopIds:y,nonShopIds:k,total:a.length,sample:H},"*")}).catch(()=>{})}catch{}}).catch(()=>{});return p}}catch{}
 
 /* ===== [Download] Search-result PiP + player + download + speed =====
  * TikTok normally renders search cards as <img> thumbnails and only creates a
@@ -1489,7 +1489,7 @@ function scanAll(){queueScan(document)}
 
 function waitForMetadata(video,timeout=1500){
 if(video.readyState>=HTMLMediaElement.HAVE_METADATA)return Promise.resolve(!0);
-return new Promise(resolve=>{let done=!1;const finish=value=>{if(done)return;done=!0;video.removeEventListener("loadedmetadata",ready);video.removeEventListener("error",failed);resolve(value)},ready=()=>finish(!0),failed=()=>finish(!1);video.addEventListener("loadedmetadata",ready,{once:!0});video.addEventListener("error",failed,{once:!0});setTimeout(()=>finish(video.readyState>=HTMLMediaElement.HAVE_METADATA),timeout)})
+return new Promise(resolve=>{let done=!1;const finish=value=>{if(done)return;done=!0;video.removeEventListener("loadedmetadata",ready);video.removeEventListener("error",failed);resolve(value)},ready=()=>finish(!0),failed=()=>{if(video.__downloadRecovering)return;finish(!1)};video.addEventListener("loadedmetadata",ready,{once:!0});video.addEventListener("error",failed);setTimeout(()=>finish(video.readyState>=HTMLMediaElement.HAVE_METADATA),timeout)})
 }
 async function enterPiP(video,waitForReady){
 if(!video||!video.isConnected)return!1;
@@ -1627,21 +1627,213 @@ pipWindow.addEventListener("pagehide",()=>handleDocumentPipClosed(pipWindow),{on
 }
 const video=warm(url,data);let host=null;try{host=pipWindow.document.getElementById(DOCUMENT_PIP_HOST_ID)}catch{}
 if(!host)host=buildDocumentPipPlayer(pipWindow,video);else{const controls=host.querySelector(".download-pip-controls");if(video.parentElement!==host||video.nextSibling!==controls)host.insertBefore(video,controls||null);video.controls=!1;video.style.cssText="display:block!important;width:100%!important;height:100%!important;background:#000!important;object-fit:contain!important;cursor:pointer!important"}
-refreshPlayerSelectButtons();bindSearchSpeed(video);if(!await waitForMetadata(video,2500))return!1;forceSearchSpeed(video);fitDocumentPipWindow(pipWindow,video);if(!startPaused){try{await video.play()}catch{}}return!0
+refreshPlayerSelectButtons();bindSearchSpeed(video);if(!await waitForMetadata(video,STREAM_FIRST_BYTES_MS))return!1;forceSearchSpeed(video);fitDocumentPipWindow(pipWindow,video);if(!startPaused){try{await video.play()}catch{}}return!0
 }
+
+/* ===== [Download] Page streams =====
+ * Playback (hover preview, search PiP, player window) used to wait for the shared resolver host, which resolves through a
+ * free upstream API (about 1 request per second for everybody) and often answered too late ("resolver_timeout").
+ * TikTok has already sent this browser the stream of every video it lists, in the JSON of its own API calls (the fetch
+ * wrapper on line 1 reads those lists and hands them to __tvtCapturePageStreams). The streams found there are passed on
+ * (tiktok-loader.js -> background.js), which answers PLAYBACK requests from them first. The resolver is still used for
+ * downloads, for videos that were not listed this way and whenever such a stream does not play (the media-stage
+ * recovery below asks for a fresh one with refresh=true, which drops the page stream).
+ * Counters: window.__tvtPageStreamStats (console of the TikTok tab), __tvtResolverStats.page (service-worker console). */
+const PAGE_STREAMS_TYPE="__DOWNLOAD_PAGE_STREAMS__",PAGE_STREAM_REPEAT_MS=10*60*1000,PAGE_STREAM_MAX=500,pageStreamStats={items:0,withStream:0,sent:0,batches:0},pageStreamKnown=new Map();
+let pageStreamReady=!1;
+try{window.__tvtPageStreamStats=pageStreamStats}catch{}
+function pageStreamHttps(value){
+try{const text=typeof value==="string"?value.trim():"";if(!text)return"";const url=new URL(text);return url.protocol==="https:"?url.href:""}catch{return""}
+}
+function pageStreamFirstUrl(list){
+if(!Array.isArray(list))return"";
+for(const entry of list){const url=pageStreamHttps(entry);if(url)return url}
+return""
+}
+/* The stream the page itself plays: the web shape (playAddr / bitrateInfo) first, then the mobile shape (play_addr /
+ * bit_rate).  H.264 plays on every PC; HEVC (bytevc1) depends on the hardware, so it is never picked. */
+function pageStreamPick(video){
+if(!video||typeof video!=="object")return"";
+const hevc=value=>/bytevc1|h265|hevc/i.test(String(value||""));
+let url="";
+if(!hevc(video.codecType)){
+url=pageStreamHttps(video.playAddr);
+if(!url&&video.PlayAddrStruct)url=pageStreamFirstUrl(video.PlayAddrStruct.UrlList)
+}
+if(!url&&Array.isArray(video.bitrateInfo)){
+for(const info of video.bitrateInfo){
+if(!info||!info.PlayAddr||hevc(info.CodecType))continue;
+url=pageStreamFirstUrl(info.PlayAddr.UrlList);if(url)break
+}
+}
+if(!url&&video.play_addr&&!hevc(video.is_bytevc1===1?"bytevc1":""))url=pageStreamFirstUrl(video.play_addr.url_list);
+if(!url&&Array.isArray(video.bit_rate)){
+for(const info of video.bit_rate){
+if(!info||!info.play_addr||info.is_bytevc1===1||hevc(info.CodecType))continue;
+url=pageStreamFirstUrl(info.play_addr.url_list);if(url)break
+}
+}
+return url
+}
+function pageStreamEntry(item){
+if(!item||typeof item!=="object")return null;
+const id=String(item.id||item.video_id||item.aweme_id||"");
+if(!/^\d{6,32}$/.test(id))return null;
+pageStreamStats.items++;
+const video=item.video,videoUrl=pageStreamPick(video);
+if(!videoUrl)return null;
+pageStreamStats.withStream++;
+const coverUrl=video?pageStreamHttps(video.cover)||pageStreamHttps(video.originCover)||pageStreamHttps(video.dynamicCover)||(video.cover&&typeof video.cover==="object"?pageStreamFirstUrl(video.cover.url_list):""):"";
+const author=item.author&&typeof item.author==="object"?String(item.author.uniqueId||item.author.unique_id||""):typeof item.author==="string"?item.author:"";
+return{id,videoUrl,coverUrl:coverUrl||"",title:typeof item.desc==="string"?item.desc.slice(0,300):"",author:author.slice(0,64)}
+}
+function pageStreamPost(entries){
+for(let i=0;i<entries.length;i+=60){
+const batch=entries.slice(i,i+60);
+pageStreamStats.sent+=batch.length;pageStreamStats.batches++;
+window.postMessage({channel:"download",type:PAGE_STREAMS_TYPE,streams:batch},location.origin)
+}
+}
+/* tiktok-loader.js (document_idle) starts after this script and after TikTok's first API calls: it announces itself with
+ * this event, and everything found so far is posted then. */
+window.addEventListener("__DOWNLOAD_PLAYER_BRIDGE_READY__",()=>{
+try{
+pageStreamReady=!0;
+const now=Date.now(),all=[];
+for(const known of pageStreamKnown.values()){known.at=now;all.push(known.entry)}
+if(all.length)pageStreamPost(all)
+}catch{}
+});
+window.__tvtCapturePageStreams=function(items){
+try{
+if(!Array.isArray(items))return;
+const now=Date.now(),fresh=[];
+for(const item of items){
+const entry=pageStreamEntry(item);
+if(!entry)continue;
+const known=pageStreamKnown.get(entry.id);
+if(known&&known.entry.videoUrl===entry.videoUrl&&now-known.at<PAGE_STREAM_REPEAT_MS)continue;
+pageStreamKnown.delete(entry.id);pageStreamKnown.set(entry.id,{entry,at:now});
+if(pageStreamKnown.size>PAGE_STREAM_MAX)pageStreamKnown.delete(pageStreamKnown.keys().next().value);
+fresh.push(entry)
+}
+if(fresh.length&&pageStreamReady)pageStreamPost(fresh)
+}catch{}
+};
+/* ===== [/Download] Page streams ===== */
 
 function validStream(data){
 try{return!!data&&typeof data.videoUrl==="string"&&new URL(data.videoUrl).protocol==="https:"}catch{return!1}}
-function streamFor(url){
-if(streamCache.has(url))return Promise.resolve(streamCache.get(url));
-if(streamRequests.has(url))return streamRequests.get(url);
-const requestId="download-pip-"+Date.now().toString(36)+"-"+(++requestNumber)+"-"+Math.random().toString(36).slice(2,8);
+/* Streams are kept for STREAM_CACHE_MS only: the resolved URLs expire, and a stale one made Picture-in-Picture and the hover
+ * preview fail until the page was reloaded. */
+const STREAM_CACHE_MS=10*60*1000,PLAYER_ERROR_ID="__download_player_error";
+/* How long a PiP / player window waits for the first bytes of the mp4.  The host that serves the file may first have to
+ * fetch it itself; 2.5 - 3 s was often too short, and Picture-in-Picture then opened with a video that never started. */
+const STREAM_FIRST_BYTES_MS=12000;
+/* ===== [Download] Media-stage recovery =====
+ * The resolver can answer fine and the stream URL can still fail to play (the host that serves the mp4 refused, stalled
+ * or dropped it).  That used to leave an empty PiP, a black player or no preview, and the 10-minute caches (here and in
+ * background.js) kept handing out the same dead URL.  Now an element whose stream fails asks ONCE for a new stream (cache
+ * bypassed) and carries on from where it was; a stream that failed for good is re-resolved the next time it is asked for.
+ * The hidden prefetch videos never recover on their own (they are not what the person waits for).
+ * Counters: window.__tvtMediaStats (console of the TikTok tab); details: "[TVT media]" lines in that console. */
+const failedStreams=new Set(),mediaStats={loaded:0,errors:0,recovered:0,gaveUp:0,codes:{}};
+try{window.__tvtMediaStats=mediaStats}catch{}
+function mediaErrorLabel(video){
+const code=video&&video.error?video.error.code:0;
+return code===1?"aborted":code===2?"network":code===3?"decode":code===4?"src_not_supported":"unknown"
+}
+/* options: priority = 0 / 1 to recover with that priority, anything else = never recover;
+ *          resume() = should the element play again once the new stream is loaded;
+ *          giveUp(page, error) = the stream could not be played at all. */
+function watchStreamMedia(video,page,options){
+try{
+if(!video||!page)return;
+if(video.__downloadStreamPage!==page)video.__downloadRecovered=!1;
+video.__downloadStreamPage=page;video.__downloadMedia=options||{};
+if(video.__downloadMediaWatch)return;
+video.__downloadMediaWatch=!0;
+video.addEventListener("loadeddata",()=>{mediaStats.loaded++});
+video.addEventListener("error",()=>{
+const current=video.__downloadStreamPage,media=video.__downloadMedia||{};
+if(!current||!video.getAttribute("src")||video.__downloadRecovering)return;
+const label=mediaErrorLabel(video),failure=new Error("media_"+label);
+mediaStats.errors++;mediaStats.codes[label]=(mediaStats.codes[label]||0)+1;
+let host="";try{host=new URL(video.currentSrc||video.getAttribute("src")).hostname}catch{}
+const canRecover=(media.priority===0||media.priority===1)&&!video.__downloadRecovered;
+try{console.warn("[TVT media]",label,host,canRecover?"- asking for a new stream":"- giving up")}catch{}
+const giveUp=()=>{mediaStats.gaveUp++;failedStreams.add(current);streamCache.delete(current);if(typeof media.giveUp==="function")try{media.giveUp(current,failure)}catch{}};
+if(!canRecover){giveUp();return}
+video.__downloadRecovered=!0;video.__downloadRecovering=!0;
+const time=Number(video.currentTime)||0;
+streamFor(current,media.priority,!0).then(data=>{
+if(video.__downloadStreamPage!==current||!video.getAttribute("src"))return;
+const resume=typeof media.resume==="function"&&media.resume()===!0;
+const restore=()=>{if(video.__downloadStreamPage!==current)return;try{if(time>.05)video.currentTime=time}catch{}if(resume)try{const played=video.play();if(played&&played.catch)played.catch(()=>{})}catch{}};
+video.addEventListener("loadedmetadata",restore,{once:!0});
+video.src=data.videoUrl;try{video.load()}catch{}
+mediaStats.recovered++
+}).catch(()=>{if(video.__downloadStreamPage===current&&video.getAttribute("src"))giveUp()}).finally(()=>{video.__downloadRecovering=!1})
+})
+}catch{}
+}
+/* ===== [/Download] Media-stage recovery ===== */
+/* The reason a stream could not be fetched (the server's own message), for tooltips, the console and the player window. */
+function streamReason(error){const text=error&&error.message?String(error.message):"";return text&&text.length<=160?" — "+text:""}
+function reportStreamError(where,error){try{console.warn("[Tik Video Toolkit] "+where+": could not get the video stream"+streamReason(error))}catch{}}
+/* The always-on-top window is requested before the stream is known (it needs the click's user activation). When the
+ * stream cannot be fetched that window would stay open and empty: close it. A window that was already showing a video
+ * is never in `request` (it is only requested when there is none). */
+function discardPipWindowRequest(request){
+if(!request)return;
+request.then(pipWindow=>{try{if(pipWindow&&pipWindow!==documentPipWindow&&!pipWindow.closed)pipWindow.close()}catch{}},()=>{})
+}
+/* A player window that could not get its stream used to be left as the plain TikTok search page with no hint why.
+ * It now shows the reason and a button to try again. */
+function showPlayerError(url,startPaused,error){
+try{
+reportStreamError("player window",error);
+let box=document.getElementById(PLAYER_ERROR_ID);if(box)box.remove();
+box=document.createElement("div");box.id=PLAYER_ERROR_ID;
+box.style.cssText="position:fixed!important;inset:0!important;z-index:2147483647!important;display:flex!important;flex-direction:column!important;align-items:center!important;justify-content:center!important;gap:14px!important;padding:24px!important;background:#000!important;color:#fff!important;font:500 14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif!important;text-align:center!important";
+const text=document.createElement("div");text.textContent="Không phát được video"+streamReason(error).replace(" — ",": ");
+const retry=document.createElement("button");retry.type="button";retry.textContent="Thử lại";
+retry.style.cssText="padding:8px 22px!important;border:0!important;border-radius:8px!important;background:#2fe4f8!important;color:#000!important;font:700 14px/1 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif!important;cursor:pointer!important";
+const again=box;retry.addEventListener("click",()=>{again.remove();openVideoPlayerStream(url,startPaused)});
+box.append(text,retry);(document.body||document.documentElement).appendChild(box)
+}catch{}
+}
+/* priority: 0 = a click or the player window, 1 = hover preview, 2 = background prefetch.  background.js queues the
+ * resolver requests by it (the free upstream API allows about one request per second). */
+function streamFor(url,priority,refresh){
+const prio=priority===1||priority===2?priority:0;
+/* refresh: the stream this page got before did not play (also remembered in failedStreams), so neither this cache nor
+ * the one in background.js may answer. */
+const forced=refresh===!0||failedStreams.has(url);
+if(forced)streamCache.delete(url);
+if(streamCache.has(url)){
+const hit=streamCache.get(url);
+if(!hit||!hit.__streamAt||Date.now()-hit.__streamAt<STREAM_CACHE_MS)return Promise.resolve(hit);
+streamCache.delete(url)
+}
+const running=streamRequests.get(url);
+if(running){
+/* The request already queued is less urgent than this one: tell the queue (the answer to this extra message is ignored). */
+if(prio<running.__meta.priority){running.__meta.priority=prio;window.postMessage({channel:"download",type:REQUEST_TYPE,requestId:"download-pip-bump-"+Date.now().toString(36)+"-"+(++requestNumber),url,priority:prio},location.origin)}
+return running
+}
+const requestId="download-pip-"+Date.now().toString(36)+"-"+(++requestNumber)+"-"+Math.random().toString(36).slice(2,8),meta={priority:prio};
 const promise=new Promise((resolve,reject)=>{
-const timer=setTimeout(()=>{pendingRequests.delete(requestId);reject(new Error("metadata_timeout"))},15000);
+const timer=setTimeout(()=>{pendingRequests.delete(requestId);reject(new Error("metadata_timeout"))},30000);
 pendingRequests.set(requestId,{resolve:data=>{clearTimeout(timer);pendingRequests.delete(requestId);resolve(data)},reject:error=>{clearTimeout(timer);pendingRequests.delete(requestId);reject(error)}});
-window.postMessage({channel:"download",type:REQUEST_TYPE,requestId,url},location.origin)
-}).then(data=>{if(!validStream(data))throw new Error("invalid_video_stream");streamCache.set(url,data);return data}).finally(()=>streamRequests.delete(url));
-streamRequests.set(url,promise);return promise
+const post=()=>{if(pendingRequests.has(requestId))window.postMessage({channel:"download",type:REQUEST_TYPE,requestId,url,priority:meta.priority,refresh:forced},location.origin)};
+post();
+/* A player window asks as soon as its page script runs, which can be before tiktok-loader.js (document_idle) is
+ * listening: that first message is lost and the request then waited for the whole time-out. Ask again when the loader
+ * announces itself and a little later (the queue in background.js answers a repeated request from the same job). */
+if(isDedicatedPlayerWindow()){window.addEventListener("__DOWNLOAD_PLAYER_BRIDGE_READY__",post,{once:!0});setTimeout(post,2000);setTimeout(post,4500)}
+}).then(data=>{if(!validStream(data))throw new Error("invalid_video_stream");data.__streamAt=Date.now();streamCache.set(url,data);failedStreams.delete(url);return data}).finally(()=>streamRequests.delete(url));
+promise.__meta=meta;streamRequests.set(url,promise);return promise
 }
 window.addEventListener("message",event=>{
 if(event.source!==window||event.origin!==location.origin)return;
@@ -1762,10 +1954,10 @@ if(!btn||busy.has(btn))return;
 busy.add(btn);setButtonState(btn,"loading","Preparing Picture-in-Picture…");
 try{
 const windowRequest=activeDocumentPipWindow()?null:requestPipWindow();
-const data=await streamFor(url);
+let data;try{data=await streamFor(url)}catch(error){discardPipWindowRequest(windowRequest);throw error}
 if(await openDocumentPiP(url,data,windowRequest)){markCardActionActive(btn,url,playerActivatedUrls,"Đã xem");return}
 flash(btn,"Unable to open the always-on-top player")
-}catch{flash(btn,"Unable to open the always-on-top player")}finally{busy.delete(btn)}
+}catch(error){reportStreamError("always-on-top player",error);flash(btn,"Unable to open the always-on-top player"+streamReason(error))}finally{busy.delete(btn)}
 }
 function openVideoPlayer(btn){
 if(!btn)return;
@@ -1843,16 +2035,17 @@ video.__downloadPlayerSource=url;video.__downloadPlayerMeta={thumb:data.coverUrl
 try{video.muted=!1}catch{}
 try{video.autoplay=startPaused!==!0}catch{}
 video.src=data.videoUrl;if(data.coverUrl)video.poster=data.coverUrl;else video.removeAttribute("poster");
+watchStreamMedia(video,url,{priority:0,resume:()=>startPaused!==!0,giveUp:(page,error)=>{closeVideoPlayer();showPlayerError(page,startPaused,error)}});
 try{video.playbackRate=searchPlaybackSpeed||1}catch{}
 bindSearchSpeed(video);try{video.load()}catch{}
-await waitForMetadata(video,3000);forceSearchSpeed(video);await playerBoundsReady(800);fitVideoPlayerWindow(video);
+await waitForMetadata(video,STREAM_FIRST_BYTES_MS);forceSearchSpeed(video);await playerBoundsReady(800);fitVideoPlayerWindow(video);
 if(startPaused===!0){try{video.pause()}catch{}}
 else if(!await ensurePlayerVideoPlaying(video,url)){
 const retry=()=>{ensurePlayerVideoPlaying(video,url)};
 video.addEventListener("canplay",retry,{once:!0});setTimeout(retry,450)
 }
 return!0
-}catch{closeVideoPlayer();return!1}
+}catch(error){closeVideoPlayer();showPlayerError(url,startPaused,error);return!1}
 }
 function launchRequestedPlayer(){
 if(playerRequestStarted)return;
@@ -1880,12 +2073,14 @@ return video
 function warm(url,data){
 const video=getWarmVideo();
 if(video.__downloadSearchPipUrl===url)return video;
-video.pause();video.__downloadSearchPipUrl=url;video.src=data.videoUrl;if(data.coverUrl)video.poster=data.coverUrl;applyGlobalVolumeBalance(video);try{video.load()}catch{}return video
+video.pause();video.__downloadSearchPipUrl=url;video.src=data.videoUrl;if(data.coverUrl)video.poster=data.coverUrl;applyGlobalVolumeBalance(video);try{video.load()}catch{}
+watchStreamMedia(video,url,{priority:0,resume:()=>!!activeDocumentPipWindow()||document.pictureInPictureElement===video,giveUp:()=>{if(video.__downloadSearchPipUrl===url)video.__downloadSearchPipUrl=null}});
+return video
 }
 async function switchWarmPiP(video,url,data){
 if(video.__downloadSearchPipUrl!==url)warm(url,data);
 bindSearchSpeed(video);
-if(!await waitForMetadata(video,2500))return!1;
+if(!await waitForMetadata(video,STREAM_FIRST_BYTES_MS))return!1;
 forceSearchSpeed(video);
 try{await video.play()}catch{}
 return document.pictureInPictureElement===video
@@ -1908,7 +2103,7 @@ if(existingDocumentPip&&warmVideo&&warmVideo.__downloadSearchPipUrl===url){exist
 /* requestWindow() must run synchronously from this click.  Stream discovery is
  * asynchronous, so requesting it after streamFor() would lose user activation. */
 const documentWindowRequest=documentPipSupported&&!existingDocumentPip?requestPipWindow():null;
-const data=btn.__downloadStream||await streamFor(url);
+let data=btn.__downloadStream;if(!data){try{data=await streamFor(url)}catch(error){discardPipWindowRequest(documentWindowRequest);throw error}}
 if(documentPipSupported){
 const opened=await openDocumentPiP(url,data,documentWindowRequest);
 if(opened){markCardActionActive(btn,url,pipActivatedUrls,"Đã xem");return}
@@ -1927,7 +2122,7 @@ const opened=await requestSelectedPiP(video,!0);
 if(opened){document.pictureInPictureElement===video?lockSearchPiP(video):unlockSearchPiP(video);markCardActionActive(btn,url,pipActivatedUrls,"Đã xem");return}
 if(document.pictureInPictureElement!==video)video.remove();
 setButtonState(btn,"ready","Video is ready — click Picture-in-Picture again")
-}catch{flash(btn,"Unable to load this TikTok video for Picture-in-Picture")}finally{busy.delete(btn)}
+}catch(error){reportStreamError("Picture-in-Picture",error);flash(btn,"Unable to load this TikTok video for Picture-in-Picture"+streamReason(error))}finally{busy.delete(btn)}
 }
 
 /* ===== [Download] Multi-select popup bridge =====
@@ -1954,7 +2149,8 @@ async function openPiPForUrl(url,notify,startPaused){
          * the comment above openPiP()'s own documentWindowRequest). */
         const documentWindowRequest=documentPipSupported&&!existingDocumentPip?requestPipWindow():null;
         report({state:"loading"});
-        const data=await streamFor(url);
+        let data;
+        try{data=await streamFor(url)}catch(error){discardPipWindowRequest(documentWindowRequest);throw error}
         if(documentPipSupported){
             const opened=await openDocumentPiP(url,data,documentWindowRequest,startPaused===!0);
             report(opened?{state:"ok"}:{state:"error",message:"Unable to open Picture-in-Picture"});
@@ -1990,8 +2186,9 @@ async function openPiPForUrl(url,notify,startPaused){
         }
         if(document.pictureInPictureElement!==video)video.remove();
         report({state:"error",message:"Video is ready — click again"})
-    }catch{
-        report({state:"error",message:"Unable to load this TikTok video for Picture-in-Picture"})
+    }catch(error){
+        reportStreamError("Picture-in-Picture (selected list)",error);
+        report({state:"error",message:"Unable to load this TikTok video for Picture-in-Picture"+streamReason(error)})
     }
 }
 window.addEventListener("__DOWNLOAD_MULTISELECT_PIP_REQUEST__",function(event){
@@ -2032,9 +2229,9 @@ let hoverMuted=!0,hoverState=null;
  * hidden <video> that lives in a closed shadow root, so the page-wide video scans never see it.  startHoverPreview()
  * then takes that already buffered <video> instead of creating a new one, so picture and sound start together.
  * Set HOVER_PREFETCH_ENABLED to false to switch the whole thing off. */
-const HOVER_PREFETCH_ENABLED=!0,HOVER_PREFETCH_MAX=6,HOVER_PREFETCH_GAP=1300;
-const hoverWarm=new Map(),hoverPrefetchSeen=new Set(),hoverPointer={x:-1,y:-1};
-let hoverWarmHost=null,hoverWarmMount=null,hoverPrefetchTimer=0,hoverPrefetchBusy=!1;
+const HOVER_PREFETCH_ENABLED=!0,HOVER_PREFETCH_MAX=3,HOVER_PREFETCH_GAP=1300;
+const hoverWarm=new Map(),hoverPrefetchSeen=new Set(),hoverPrefetchFails=new Map(),hoverPointer={x:-1,y:-1};
+let hoverWarmHost=null,hoverWarmMount=null,hoverPrefetchTimer=0,hoverPrefetchBusy=!1,hoverPrefetchPausedUntil=0;
 function getHoverWarmMount(){
 if(hoverWarmHost&&hoverWarmHost.isConnected&&hoverWarmMount)return hoverWarmMount;
 const host=document.createElement("div");
@@ -2068,10 +2265,10 @@ const video=document.createElement("video");
 prepareCorsVideo(video);
 video.muted=!0;video.loop=!0;video.playsInline=!0;video.preload="auto";video.disablePictureInPicture=!0;
 video.style.cssText="display:block!important;width:100%!important;height:100%!important;object-fit:cover!important;background:#000!important";
-video.addEventListener("error",()=>{const entry=hoverWarm.get(url);if(entry&&entry.video===video)dropHoverWarm(url)});
 hoverWarm.set(url,{video});
 getHoverWarmMount().appendChild(video);
 video.src=data.videoUrl;
+watchStreamMedia(video,url,{giveUp:()=>{const entry=hoverWarm.get(url);if(entry&&entry.video===video)dropHoverWarm(url)}});
 try{video.load()}catch{}
 }
 /* Cards on screen that have a stream URL and are not warmed / hovered / tried yet, nearest to the pointer first. */
@@ -2093,16 +2290,23 @@ out.sort((a,b)=>a.d-b.d);
 return out
 }
 async function hoverPrefetchTick(){
-if(hoverPrefetchBusy||!hoverPreviewEnabled||hoverState||document.hidden||!isSearchPage()||isDedicatedPlayerWindow()||hoverWarm.size>=HOVER_PREFETCH_MAX)return;
+if(hoverPrefetchBusy||!hoverPreviewEnabled||hoverState||document.hidden||!isSearchPage()||isDedicatedPlayerWindow()||hoverWarm.size>=HOVER_PREFETCH_MAX||Date.now()<hoverPrefetchPausedUntil)return;
 hoverPrefetchBusy=!0;
+let tried="";
 try{
 const next=hoverCardsInView()[0];
 if(!next)return;
-if(hoverPrefetchSeen.size>600)hoverPrefetchSeen.clear();
-hoverPrefetchSeen.add(next.url);
-const data=await streamFor(next.url);
+if(hoverPrefetchSeen.size>600){hoverPrefetchSeen.clear();hoverPrefetchFails.clear()}
+hoverPrefetchSeen.add(next.url);tried=next.url;
+const data=await streamFor(next.url,2);
+tried="";
 if(hoverPreviewEnabled&&!hoverState)warmHoverVideo(next.url,data)
-}catch{}finally{hoverPrefetchBusy=!1}
+}catch(error){
+/* A refusal means the server or its upstream is busy: this card is tried again later (at most twice) and the loop stays
+ * quiet for a while, so background work does not spend the request budget that a click or a hover needs. */
+if(tried){const fails=(hoverPrefetchFails.get(tried)||0)+1;hoverPrefetchFails.set(tried,fails);if(fails<2)hoverPrefetchSeen.delete(tried)}
+hoverPrefetchPausedUntil=Date.now()+(/\[(busy|superseded)\]/.test(String(error&&error.message))?4000:15000)
+}finally{hoverPrefetchBusy=!1}
 }
 function startHoverPrefetch(){
 if(!HOVER_PREFETCH_ENABLED||hoverPrefetchTimer)return;
@@ -2183,13 +2387,13 @@ if(state.button)state.button.remove()
 async function startHoverPreview(state){
 if(hoverState!==state)return;
 let data;
-try{data=await streamFor(state.url)}catch{
+try{data=await streamFor(state.url,1)}catch{
 /* With no dwell, sweeping across the grid can fire several metadata requests at once and
  * the free API may refuse one: retry once if this card is still the hovered one. */
 if(hoverState!==state)return;
 await new Promise(resolve=>setTimeout(resolve,1200));
 if(hoverState!==state)return;
-try{data=await streamFor(state.url)}catch{return}
+try{data=await streamFor(state.url,1)}catch{return}
 }
 const host=state.host;
 if(hoverState!==state||!host.isConnected)return;
@@ -2215,10 +2419,10 @@ wrap.style.opacity="1";
 if(!state.button){state.button=makeHoverMuteButton(state,box);host.appendChild(state.button)}
 renderHoverMuteButton(state)
 },{once:!0});
-video.addEventListener("error",()=>{streamCache.delete(state.url);if(hoverState===state)stopHoverPreview()});
 host.appendChild(wrap);
 /* A pooled video is already loading this stream: assigning src again would restart it. */
 if(!warmed||video.getAttribute("src")!==data.videoUrl)video.src=data.videoUrl;
+watchStreamMedia(video,state.url,{priority:1,resume:()=>hoverState===state,giveUp:()=>{if(hoverState===state)stopHoverPreview()}});
 try{await video.play()}catch{
 if(hoverState!==state)return;
 if(!video.muted){

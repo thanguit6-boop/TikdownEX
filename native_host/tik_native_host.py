@@ -12,7 +12,7 @@ UTF-8. Vì stdout là kênh trả lời cho Chrome nên TUYỆT ĐỐI không pr
 
 TIN NHẮN extension -> host (trường "id" nếu có sẽ được trả nguyên lại):
   {"action": "ping"}
-      -> {"ok": true, "host": "...", "version": 4, "platform": "win32", "python": "3.x.y"}
+      -> {"ok": true, "host": "...", "version": 5, "platform": "win32", "python": "3.x.y"}
   {"action": "check_app", "appPath": "D:\\\\App\\\\popup_select_video.exe"}
       -> {"ok": true, "kind": "exe" | "py", "appPath": "..."}   (chỉ kiểm tra, không mở gì)
   {"action": "choose_folder", "initialPath": "D:\\Video"}
@@ -20,10 +20,12 @@ TIN NHẮN extension -> host (trường "id" nếu có sẽ được trả nguy�
          (mở hộp thoại chọn thư mục kiểu Explorer của Windows; cancelled=true nếu người
          dùng bấm Hủy. initialPath tùy chọn: hộp thoại mở sẵn ở thư mục đó, nếu thư mục đã
          mất thì mở ở thư mục cha gần nhất còn tồn tại; bỏ trống thì mở ở vị trí mặc định)
-  {"action": "choose_app_file"}
+  {"action": "choose_app_file", "purpose": "tikdowntp"}
       -> {"ok": true, "cancelled": false, "path": "D:\\App\\popup_select_video.py",
           "kind": "exe" | "py"}
-         (mở hộp thoại chọn file .exe/.py; cancelled=true nếu người dùng bấm Hủy)
+         (mở hộp thoại chọn file .exe/.py; cancelled=true nếu người dùng bấm Hủy.
+         "purpose" tùy chọn: "tikdowntp" thì hộp thoại có tiêu đề/bộ lọc dành cho TikdownTP,
+         bỏ trống thì là hộp thoại chọn app sửa video như trước)
   {"action": "open_video", "appPath": "<đường dẫn đầy đủ .exe hoặc .py>",
    "videoPath": "<đường dẫn đầy đủ video>"}
       -> {"ok": true, "mode": "exe" | "py", "pid": 1234}
@@ -46,6 +48,23 @@ TIN NHẮN extension -> host (trường "id" nếu có sẽ được trả nguy�
          Mở thư mục đó trong Explorer (nút "Mở thư mục" của popup "Video đã chọn"). Giống
          open_saved_video: thư mục phải có file marker .tvt chứa đúng rootToken, nên chỉ mở
          được thư mục mà extension vừa xác nhận, không mở được thư mục tùy ý.
+  {"action": "send_to_tikdowntp", "appPath": "D:\\TikdownTP\\TikdownTP.exe",
+   "rootPath": "D:\\Video", "rootToken": "...", "name": "Dép Nesty Ne01",
+   "batches": [{"folderName": "Khách A" | "", "links": ["https://www.tiktok.com/@a/video/1"]}]}
+      -> {"ok": true, "action": "send_to_tikdowntp", "accepted": 12, "batches": 2, "launched": false}
+         Nút "Tải bằng TikdownTP" của popup "Video đã chọn". Mỗi batch = 1 thư mục tải
+         (rootPath\\folderName, folderName rỗng = chính rootPath); thư mục con chưa có thì host
+         tạo. rootPath/rootToken kiểm tra giống open_saved_video (marker .tvt). Host KHÔNG tự
+         tải gì: nó ghi 1 file lệnh vào %LOCALAPPDATA%\\TikDownTP\\ExtInbox rồi chờ TikdownTP
+         trả lời. Nếu TikdownTP chưa chạy thì host mở nó (appPath) trước, rồi chờ tối đa
+         ~24 giây. Chỉ báo ok khi TikdownTP đã NHẬN lệnh (nó tự điền link + tên vào ô nhập
+         link, đặt thư mục tải rồi bấm Download khi rảnh). Không ai nhận -> host rút lệnh về
+         và báo lỗi, để extension giữ nguyên video trong danh sách.
+         Giao thức hộp thư (thư mục ExtInbox):
+           heartbeat.json   TikdownTP ghi mỗi giây {"pid","time"}: còn tươi = app đang chạy
+           launch.json      host ghi {"pid","time"} khi vừa mở app: tránh mở bản thứ hai
+           <id>.job.json    host ghi: {"schema":1,"id","batches":[{"dir","name","links":[]}]}
+           <id>.reply.json  TikdownTP ghi {"ok":true|false,"error","message"} khi nhận/từ chối
   Lỗi luôn có dạng {"ok": false, "error": "<mã>", "message": "<tiếng Việt>"}.
   Mã lỗi: bad_request, unknown_action, unsupported_os, app_path_missing,
   app_path_invalid, app_not_found, app_bad_type, video_path_missing,
@@ -53,7 +72,9 @@ TIN NHẮN extension -> host (trường "id" nếu có sẽ được trả nguy�
   root_path_invalid, root_path_not_found, folder_name_invalid,
   file_name_invalid, root_token_invalid, root_token_mismatch,
   root_marker_write_failed, folder_picker_failed, app_picker_failed,
-  app_picker_timeout, launch_failed, internal_error.
+  app_picker_timeout, launch_failed, internal_error, batch_invalid, batch_duplicate,
+  link_invalid, too_many_links, name_invalid, inbox_write_failed, tikdowntp_no_reply,
+  tikdowntp_rejected.
 
 CÁCH MỞ APP (chọn theo đuôi file của appPath):
   .exe : chạy  <exe> --from-main-app --open-video "<video>" [--open-root
@@ -111,7 +132,7 @@ import time
 import traceback
 
 HOST_NAME = "com.tik_video_toolkit.editor_bridge"
-HOST_VERSION = 4
+HOST_VERSION = 5
 # Bản đóng gói PyInstaller (.exe): __file__ trỏ vào thư mục tạm lúc giải nén, nên lấy
 # thư mục chứa chính file .exe làm HERE (nơi đặt file khai báo .json).
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -155,6 +176,23 @@ LOCATE_SKIP_DIRS = {
     "system volume information", "recovery", "msocache", "perflogs",
     "node_modules", ".git",
 }
+
+# ===== [Download] TikdownTP constants =====
+TIKDOWNTP_DATA_DIR = "TikDownTP"   # %LOCALAPPDATA%\\TikDownTP: cùng thư mục dữ liệu TikdownTP dùng
+TIKDOWNTP_INBOX_DIR = "ExtInbox"   # giữ khớp _ext_inbox_dir() trong TikdownTP.py
+TIKDOWNTP_SCHEMA = 1
+TIKDOWNTP_MAX_LINKS = 500
+TIKDOWNTP_MAX_BATCHES = 50
+TIKDOWNTP_MAX_LINK_LEN = 500
+TIKDOWNTP_MAX_NAME_LEN = 150
+TIKDOWNTP_HEARTBEAT_STALE = 6.0    # giây: heartbeat cũ hơn mức này = TikdownTP không chạy
+TIKDOWNTP_REPLY_SECONDS = 24       # < 30 giây (service worker của Chrome ngủ sau 30 giây)
+TIKDOWNTP_LATE_REPLY_SECONDS = 4   # chờ thêm khi app vừa nhận lệnh đúng lúc host định rút
+TIKDOWNTP_STARTING_SECONDS = 120   # app vừa được host mở trong khoảng này = "đang khởi động"
+TIKDOWNTP_URL_RE = re.compile(r"^https://([a-z0-9-]+\.)*tiktok\.com/\S+$", re.IGNORECASE)
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STILL_ACTIVE = 259
+# ===== [/Download] TikdownTP constants =====
 
 MAX_TEXT_LEN = 1024            # độ dài tối đa của 1 đường dẫn nhận từ extension
 MAX_INCOMING_BYTES = 1024 * 1024  # tin nhắn gửi tới host chỉ nhỏ xíu, chặn cái quá khổ
@@ -333,9 +371,12 @@ exit 2
 
 POWERSHELL_PICK_APP_SCRIPT = r"""
 Add-Type -AssemblyName System.Windows.Forms
+# Tiêu đề/bộ lọc đi qua biến môi trường (TIKVT_PICK_*), để trống thì dùng mặc định của app sửa video.
+$pickTitle = if ($env:TIKVT_PICK_TITLE) { $env:TIKVT_PICK_TITLE } else { 'Chọn app sửa video' }
+$pickFilter = if ($env:TIKVT_PICK_FILTER) { $env:TIKVT_PICK_FILTER } else { 'App sửa video (*.exe;*.py)|*.exe;*.py|Tất cả file (*.*)|*.*' }
 $dialog = New-Object System.Windows.Forms.OpenFileDialog
-$dialog.Title = 'Chọn app sửa video'
-$dialog.Filter = 'App sửa video (*.exe;*.py)|*.exe;*.py|Tất cả file (*.*)|*.*'
+$dialog.Title = $pickTitle
+$dialog.Filter = $pickFilter
 $dialog.FilterIndex = 1
 $dialog.Multiselect = $false
 $dialog.CheckFileExists = $true
@@ -582,13 +623,24 @@ def choose_folder(initial_path_value=None):
     }
 
 
-def choose_app_file():
-    """Hiện hộp thoại chọn file .exe/.py và kiểm tra ngay file đã chọn."""
+def choose_app_file(purpose=None):
+    """Hiện hộp thoại chọn file .exe/.py và kiểm tra ngay file đã chọn.
+
+    purpose == "tikdowntp": hộp thoại có tiêu đề/bộ lọc dành cho TikdownTP (nút
+    "Tải bằng TikdownTP"); giá trị khác hoặc bỏ trống: hộp thoại chọn app sửa video.
+    """
     if not _is_windows():
         raise HostError("unsupported_os", "Cầu nối này chỉ chạy trên Windows.")
+    env = dict(os.environ)
+    env["TIKVT_PICK_TITLE"] = ""
+    env["TIKVT_PICK_FILTER"] = ""
+    if purpose == "tikdowntp":
+        env["TIKVT_PICK_TITLE"] = "Chọn TikdownTP (TikdownTP.exe hoặc TikdownTP.py)"
+        env["TIKVT_PICK_FILTER"] = "TikdownTP (*.exe;*.py)|*.exe;*.py|Tất cả file (*.*)|*.*"
     try:
         proc = subprocess.run(
             _encoded_powershell_command(POWERSHELL_PICK_APP_SCRIPT, sta=True),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -601,7 +653,7 @@ def choose_app_file():
         log("app_picker_failed: " + repr(exc))
         raise HostError("app_picker_failed", "Không mở được hộp thoại chọn app: " + str(exc))
     if proc.returncode == 2:
-        return {"ok": True, "action": "choose_app", "cancelled": True}
+        return {"ok": True, "action": "choose_app", "cancelled": True, "purpose": purpose or ""}
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip()
         log("app_picker_failed exit=%s stderr=%s" % (proc.returncode, detail))
@@ -610,7 +662,7 @@ def choose_app_file():
         app_path, kind = _check_app(proc.stdout.decode("utf-8", "replace").strip())
     except HostError:
         raise HostError("app_picker_failed", "File đã chọn phải là app .exe hoặc .py đang tồn tại.")
-    return {"ok": True, "action": "choose_app", "cancelled": False, "path": app_path, "kind": kind}
+    return {"ok": True, "action": "choose_app", "cancelled": False, "path": app_path, "kind": kind, "purpose": purpose or ""}
 
 
 def _valid_root_token(value):
@@ -994,6 +1046,308 @@ def open_video(app_path_value, video_path_value, root_path="", folder_name=""):
     return {"ok": True, "action": "open_video", "mode": kind, "pid": proc.pid}
 
 
+# ===== [Download] send_to_tikdowntp =====
+def _tikdowntp_inbox_dir():
+    """Thư mục hộp thư host <-> TikdownTP (tạo nếu chưa có)."""
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    path = os.path.join(base, TIKDOWNTP_DATA_DIR, TIKDOWNTP_INBOX_DIR)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        log("inbox_write_failed (mkdir): " + repr(exc))
+        raise HostError("inbox_write_failed", "Không tạo được thư mục trao đổi với TikdownTP: " + path)
+    return path
+
+
+def _read_json_file(path):
+    """Đọc 1 file JSON nhỏ; thiếu file hoặc đang ghi dở (JSON hỏng) thì trả None."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_json_atomic(path, data):
+    temp_path = path + ".tmp-" + str(os.getpid())
+    try:
+        with open(temp_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        log("inbox_write_failed: " + repr(exc))
+        raise HostError("inbox_write_failed", "Không ghi được lệnh cho TikdownTP: " + str(exc))
+
+
+def _pid_alive(pid):
+    """True nếu tiến trình pid còn chạy (Windows: OpenProcess + GetExitCodeProcess)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if _is_windows():
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong(0)
+                if not kernel32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception as exc:
+            log("pid_alive_failed: " + repr(exc))
+            return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _tikdowntp_running(inbox):
+    """TikdownTP đang chạy nếu heartbeat.json còn tươi (TikdownTP ghi mỗi giây)."""
+    for attempt in range(2):
+        data = _read_json_file(os.path.join(inbox, "heartbeat.json"))
+        if data is not None:
+            try:
+                return time.time() - float(data.get("time")) < TIKDOWNTP_HEARTBEAT_STALE
+            except (TypeError, ValueError):
+                return False
+        if attempt == 0:
+            time.sleep(0.05)  # file có thể đang được thay đúng lúc đọc
+    return False
+
+
+def _tikdowntp_starting(inbox):
+    """True nếu host vừa mở TikdownTP chưa lâu và tiến trình đó còn sống (đang khởi động)."""
+    data = _read_json_file(os.path.join(inbox, "launch.json"))
+    if data is None:
+        return False
+    try:
+        age = time.time() - float(data.get("time"))
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age < TIKDOWNTP_STARTING_SECONDS and _pid_alive(data.get("pid"))
+
+
+def _launch_tikdowntp(app_path, kind, inbox):
+    """Mở TikdownTP (.exe hoặc .py) rồi ghi launch.json. Không đợi app chạy xong."""
+    app_dir = os.path.dirname(app_path)
+    try:
+        if kind == "exe":
+            proc = _spawn([app_path], app_dir, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                          _child_env(), discard_streams=True)
+        else:
+            python_exe = _python_for_app()
+            if not python_exe:
+                raise HostError("launch_failed", "Không tìm thấy Python (py hoặc python) trong PATH để chạy TikdownTP.py.")
+            env = dict(_child_env() or os.environ)
+            env.setdefault("PYTHONIOENCODING", "utf-8:replace")
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            log_stream = None
+            try:
+                log_path = os.path.join(os.path.dirname(_log_path()), "tikdowntp_app.log")
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                log_stream = open(log_path, "ab")
+                log_stream.write(("\n--- %s mở TikdownTP: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), app_path)).encode("utf-8"))
+                log_stream.flush()
+            except OSError as exc:
+                log("không mở được tikdowntp_app.log: " + repr(exc))
+                log_stream = None
+            try:
+                proc = _spawn([python_exe, app_path], app_dir, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                              env, discard_streams=log_stream is None, log_stream=log_stream)
+            finally:
+                if log_stream is not None:
+                    log_stream.close()
+    except OSError as exc:
+        log("launch_failed (TikdownTP): " + repr(exc))
+        raise HostError("launch_failed", "Không mở được TikdownTP: " + str(exc))
+    try:
+        _write_json_atomic(os.path.join(inbox, "launch.json"), {"pid": proc.pid, "time": time.time()})
+    except HostError:
+        pass  # chỉ để tránh mở 2 lần; thiếu file này không làm hỏng việc gửi
+    log("launch TikdownTP mode=%s pid=%s app=%s" % (kind, proc.pid, app_path))
+
+
+def _tikdowntp_name(value):
+    """Tên đặt khi tải: chuỗi (có thể rỗng), bỏ ký tự điều khiển, tối đa 150 ký tự."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise HostError("name_invalid", "Tên đặt khi tải không hợp lệ.")
+    name = "".join(ch for ch in value if ch >= " " and ch != "\x7f").strip()
+    if len(name) > TIKDOWNTP_MAX_NAME_LEN:
+        raise HostError("name_invalid", "Tên đặt khi tải quá dài (tối đa %d ký tự)." % TIKDOWNTP_MAX_NAME_LEN)
+    return name
+
+
+def _tikdowntp_links(value):
+    """Danh sách link TikTok hợp lệ của 1 batch (bỏ trùng, giữ thứ tự) hoặc ném HostError."""
+    if not isinstance(value, list) or not value:
+        raise HostError("batch_invalid", "Mỗi thư mục phải có ít nhất 1 link.")
+    links = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise HostError("link_invalid", "Có link không hợp lệ.")
+        link = item.strip()
+        if (not link or len(link) > TIKDOWNTP_MAX_LINK_LEN or not TIKDOWNTP_URL_RE.match(link)
+                or any(ch < " " for ch in link)):
+            raise HostError("link_invalid", "Có link không phải link TikTok: " + link[:80])
+        if link not in seen:
+            seen.add(link)
+            links.append(link)
+    return links
+
+
+def _tikdowntp_batch_dir(real_root, folder_name_value):
+    """Thư mục tải của 1 batch: real_root hoặc real_root\\<thư mục con>. Chặn ../ và symlink
+    trỏ ra ngoài (so sánh đường dẫn đã realpath), thư mục con chưa có thì tạo."""
+    folder_name = _optional_folder_name(folder_name_value)
+    target = os.path.realpath(os.path.join(real_root, folder_name)) if folder_name else real_root
+    try:
+        inside_root = os.path.commonpath([real_root, target]) == real_root
+    except ValueError:
+        inside_root = False
+    if not inside_root:
+        raise HostError("folder_name_invalid", "Thư mục con không nằm trong thư mục gốc đã chọn.")
+    if not os.path.isdir(target):
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError as exc:
+            log("batch_dir_create_failed: " + repr(exc))
+            raise HostError("folder_name_invalid", "Không tạo được thư mục con: " + target)
+    return folder_name, target
+
+
+def _wait_tikdowntp_reply(reply_path, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        data = _read_json_file(reply_path)
+        if data is not None:
+            return data
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.2)
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def send_to_tikdowntp(req):
+    """Gửi các video đã chọn sang TikdownTP (xem mô tả action trong docstring đầu file)."""
+    if not _is_windows():
+        raise HostError("unsupported_os", "Cầu nối này chỉ chạy trên Windows.")
+    app_path, kind = _check_app(req.get("appPath"))
+    root_path = _clean_path(req.get("rootPath"), "root_path_missing", "root_path_invalid", "thư mục gốc")
+    if not os.path.isdir(root_path):
+        raise HostError("root_path_not_found", "Không tìm thấy thư mục gốc: " + root_path)
+    root_token = req.get("rootToken")
+    if not _valid_root_token(root_token):
+        raise HostError("root_token_invalid", "Mã xác nhận thư mục gốc không hợp lệ. Hãy chọn lại thư mục trong Video đã chọn.")
+    if not secrets.compare_digest(_read_root_marker(root_path), root_token):
+        raise HostError(
+            "root_token_mismatch",
+            "Thư mục Chrome đang dùng không khớp đường dẫn đã lưu. Hãy chọn lại thư mục trong Video đã chọn.",
+        )
+    name = _tikdowntp_name(req.get("name"))
+    raw_batches = req.get("batches")
+    if not isinstance(raw_batches, list) or not raw_batches:
+        raise HostError("batch_invalid", "Chưa có video nào để gửi sang TikdownTP.")
+    if len(raw_batches) > TIKDOWNTP_MAX_BATCHES:
+        raise HostError("batch_invalid", "Quá nhiều thư mục trong một lần gửi (tối đa %d)." % TIKDOWNTP_MAX_BATCHES)
+
+    real_root = os.path.realpath(root_path)
+    batches = []
+    seen_dirs = set()
+    total = 0
+    for raw in raw_batches:
+        if not isinstance(raw, dict):
+            raise HostError("batch_invalid", "Dữ liệu thư mục gửi sang TikdownTP không hợp lệ.")
+        links = _tikdowntp_links(raw.get("links"))
+        total += len(links)
+        if total > TIKDOWNTP_MAX_LINKS:
+            raise HostError("too_many_links", "Quá nhiều link trong một lần gửi (tối đa %d)." % TIKDOWNTP_MAX_LINKS)
+        folder_name, target = _tikdowntp_batch_dir(real_root, raw.get("folderName"))
+        key = os.path.normcase(target)
+        if key in seen_dirs:
+            raise HostError("batch_duplicate", "Hai nhóm video cùng trỏ về một thư mục: " + (folder_name or os.path.basename(real_root)))
+        seen_dirs.add(key)
+        batches.append({"dir": target, "name": name, "links": links})
+
+    inbox = _tikdowntp_inbox_dir()
+    job_id = time.strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(6)
+    job_path = os.path.join(inbox, job_id + ".job.json")
+    reply_path = os.path.join(inbox, job_id + ".reply.json")
+    _write_json_atomic(job_path, {"schema": TIKDOWNTP_SCHEMA, "id": job_id, "created": time.time(), "batches": batches})
+
+    launched = False
+    starting = False
+    try:
+        if not _tikdowntp_running(inbox):
+            if _tikdowntp_starting(inbox):
+                starting = True  # đã có bản vừa được mở: chỉ chờ, KHÔNG mở bản thứ hai
+            else:
+                _launch_tikdowntp(app_path, kind, inbox)
+                launched = True
+    except HostError:
+        _remove_quietly(job_path)
+        raise
+
+    reply = _wait_tikdowntp_reply(reply_path, TIKDOWNTP_REPLY_SECONDS)
+    if reply is None:
+        if _remove_quietly(job_path):
+            # Không ai nhận: rút lệnh về để TikdownTP không tự tải sau khi người dùng đã thấy báo lỗi.
+            log("send_to_tikdowntp: không có phản hồi, đã rút lệnh %s (launched=%s starting=%s)" % (job_id, launched, starting))
+            if launched or starting:
+                raise HostError(
+                    "tikdowntp_no_reply",
+                    "TikdownTP đang khởi động chậm. Chờ app mở xong rồi bấm lại (video vẫn còn trong danh sách).",
+                )
+            raise HostError(
+                "tikdowntp_no_reply",
+                "TikdownTP không phản hồi. Nếu TikdownTP đã mở từ trước thì cần cập nhật lên bản mới có "
+                "nhận link từ extension, rồi bấm lại.",
+            )
+        # File lệnh đã biến mất = app vừa nhận đúng lúc này: chờ thêm câu trả lời.
+        reply = _wait_tikdowntp_reply(reply_path, TIKDOWNTP_LATE_REPLY_SECONDS)
+        if reply is None:
+            log("send_to_tikdowntp: lệnh %s đã được nhận nhưng không có câu trả lời" % job_id)
+            raise HostError("tikdowntp_no_reply", "TikdownTP nhận lệnh nhưng chưa trả lời. Kiểm tra TikdownTP rồi bấm lại nếu chưa thấy tải.")
+    _remove_quietly(reply_path)
+    if reply.get("ok") is True:
+        log("send_to_tikdowntp ok job=%s links=%d batches=%d launched=%s" % (job_id, total, len(batches), launched))
+        return {
+            "ok": True, "action": "send_to_tikdowntp",
+            "accepted": total, "batches": len(batches), "launched": launched,
+        }
+    message = reply.get("message") if isinstance(reply.get("message"), str) and reply.get("message") else "TikdownTP từ chối lệnh."
+    log("send_to_tikdowntp rejected job=%s error=%r" % (job_id, reply.get("error")))
+    raise HostError("tikdowntp_rejected", message)
+# ===== [/Download] send_to_tikdowntp =====
+
+
 def handle_request(req):
     if not isinstance(req, dict):
         return _fail("bad_request", "Tin nhắn không hợp lệ (cần là 1 object JSON).")
@@ -1010,7 +1364,7 @@ def handle_request(req):
         elif action == "choose_folder":
             resp = choose_folder(req.get("initialPath"))
         elif action == "choose_app_file":
-            resp = choose_app_file()
+            resp = choose_app_file(req.get("purpose"))
         elif action == "open_video":
             resp = open_video(req.get("appPath"), req.get("videoPath"))
         elif action == "open_saved_video":
@@ -1023,6 +1377,8 @@ def handle_request(req):
             )
         elif action == "open_folder":
             resp = open_folder(req.get("rootPath"), req.get("rootToken"))
+        elif action == "send_to_tikdowntp":
+            resp = send_to_tikdowntp(req)
         elif action == "locate_folder":
             resp = locate_folder(
                 req.get("folderName"),
